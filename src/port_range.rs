@@ -1,5 +1,5 @@
-use std::ops::RangeInclusive;
 use serde::Deserialize;
+use std::ops::RangeInclusive;
 
 // custom wrapper for parsing ranges
 #[derive(Debug, Clone)]
@@ -15,7 +15,9 @@ impl<'de> Deserialize<'de> for PortRange {
         let start = arr[0];
         let end = arr[1];
         if start > end {
-            return Err(serde::de::Error::custom("Range start must not be greater than end"));
+            return Err(serde::de::Error::custom(
+                "Range start must not be greater than end",
+            ));
         }
         Ok(PortRange(start..=end))
     }
@@ -34,7 +36,7 @@ impl Iterator for PortRange {
 // impl IntoIterator for PortRange {
 //     type Item = u16;
 //     type IntoIter = std::ops::RangeInclusive<u16>;
-// 
+//
 //     fn into_iter(self) -> Self::IntoIter {
 //         self.0
 //     }

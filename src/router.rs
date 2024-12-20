@@ -102,11 +102,13 @@ impl Router {
     pub fn get_backward_routes(&self) -> &HashMap<SocketAddr, SocketAddr> {
         &self.backward_routes
     }
-    
-    pub fn to_forward_backward_routes(self) -> (HashMap<SocketAddr, SocketAddr>, HashMap<SocketAddr, SocketAddr>) {
-        (
-            self.forward_routes,
-            self.backward_routes
-        )
+
+    pub fn to_forward_backward_routes(
+        self,
+    ) -> (
+        HashMap<SocketAddr, SocketAddr>,
+        HashMap<SocketAddr, SocketAddr>,
+    ) {
+        (self.forward_routes, self.backward_routes)
     }
 }

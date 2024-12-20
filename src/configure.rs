@@ -1,10 +1,12 @@
-use std::net::{IpAddr, SocketAddr};
-use tokio::io;
-use serde_derive::{Deserialize};
 use crate::port_range::PortRange;
 use crate::router::Router;
+use serde_derive::Deserialize;
+use std::net::{IpAddr, SocketAddr};
+use tokio::io;
 
-const fn default_buffer_pool_size() -> usize { 10_000 }
+const fn default_buffer_pool_size() -> usize {
+    10_000
+}
 
 #[derive(Deserialize, Debug)]
 pub struct Config {
@@ -41,14 +43,14 @@ pub enum RouteConfig {
         remote_addr: IpAddr,
         local_port_range: PortRange,
         remote_port_range: PortRange,
-    }
+    },
 }
 
 impl Config {
     pub async fn load_file(path: String) -> io::Result<Config> {
         let content = tokio::fs::read_to_string(path).await?;
-        let config: Config = toml::from_str(&content)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let config: Config =
+            toml::from_str(&content).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         Ok(config)
     }
 
@@ -60,21 +62,30 @@ impl Config {
                 RouteConfig::SinglePort { local, remote } => {
                     router.add_route(*local, *remote);
                 }
-                RouteConfig::ManyPorts { local_addr, remote_addr, ports} => {
+                RouteConfig::ManyPorts {
+                    local_addr,
+                    remote_addr,
+                    ports,
+                } => {
                     for &port in ports {
                         router.add_route(
-                            SocketAddr::new(*local_addr, port), 
+                            SocketAddr::new(*local_addr, port),
                             SocketAddr::new(*remote_addr, port),
                         );
                     }
-                },
-                RouteConfig::ManyComplexPorts { local_addr, remote_addr, local_ports, remote_ports} => {
+                }
+                RouteConfig::ManyComplexPorts {
+                    local_addr,
+                    remote_addr,
+                    local_ports,
+                    remote_ports,
+                } => {
                     assert_eq!(
                         local_ports.len(),
                         remote_ports.len(),
                         "cannot have an unequal number of local and remote ports"
                     );
-                    
+
                     for (&local_port, &remote_port) in local_ports.iter().zip(remote_ports.iter()) {
                         router.add_route(
                             SocketAddr::new(*local_addr, local_port),
@@ -82,16 +93,23 @@ impl Config {
                         );
                     }
                 }
-                RouteConfig::SimpleRange { local_addr: local, remote_addr: remote, port_range } => {
-                    router.add_direct_routes( *local, *remote, port_range.clone())
-                }
-                RouteConfig::ComplexPortRange { local_addr: local, remote_addr: remote, local_port_range, remote_port_range } => {
+                RouteConfig::SimpleRange {
+                    local_addr: local,
+                    remote_addr: remote,
+                    port_range,
+                } => router.add_direct_routes(*local, *remote, port_range.clone()),
+                RouteConfig::ComplexPortRange {
+                    local_addr: local,
+                    remote_addr: remote,
+                    local_port_range,
+                    remote_port_range,
+                } => {
                     router.add_offset_routes(*local, local_port_range.clone(), *remote, remote_port_range.clone())
                         .expect(format!("local port range {local_port_range:?} must be the same length as remote port range {remote_port_range:?}").as_str());
                 }
             }
         }
-        
+
         router
     }
 }
