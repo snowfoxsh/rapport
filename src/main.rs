@@ -14,6 +14,7 @@ use futures::future::join_all;
 use log::{debug, error, info, warn};
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
+use std::mem::MaybeUninit;
 use std::net::{SocketAddr, UdpSocket as _DontUseUdpSocket};
 use std::ops::Deref;
 use std::sync::Arc;
@@ -23,7 +24,9 @@ use tokio::{io, task};
 
 use dashmap::mapref::one::Ref;
 use std::os::unix::io::AsRawFd;
+use futures::TryStreamExt;
 use tokio::io::Interest;
+use tokio::task::JoinHandle;
 // use crate::router::Router;
 
 /// Sets the `IP_TRANSPARENT` option for a given `UdpSocket`
@@ -47,7 +50,6 @@ fn set_ip_transparent(socket: &UdpSocket) -> io::Result<()> {
     Ok(())
 }
 
-/// bind to all required sockets concurrently
 
 /// bind to all required sockets concurrently
 async fn bind_sockets(socket_addrs: HashSet<SocketAddr>) -> Vec<Arc<UdpSocket>> {
@@ -151,38 +153,92 @@ fn set_unlimited_resource() -> io::Result<()> {
     Ok(())
 }
 
+#[derive(Clone)]
 struct Connection {
-    send_socket: UdpSocket,
+    send_socket: Arc<UdpSocket>,
     send_to: SocketAddr,
 
-    recv_socket: Arc<UdpSocket>,
-    recv_from: SocketAddr,
+    recv_socket: Arc<UdpSocket>, // mark unused
+    recv_in: SocketAddr,
+
+
+    origin_addr: SocketAddr,
+    recv_handle: Option<Arc<JoinHandle<io::Result<()>>>>
     // maybe store a ref to the buffer pool
-    // we will need a list of valid return addresses
 }
+// maybe will need a list of valid return addresses
 
 impl Connection {
-    async fn new( local_sock: Arc<UdpSocket>,send_to: SocketAddr) -> io::Result<Connection> {
+    async fn new(origin_addr: SocketAddr, recv_socket: Arc<UdpSocket>, send_to: SocketAddr) -> io::Result<Connection> {
         // get the address of the local socket
         // tiny bit of unnecessary overhead here
-        let receive_from = local_sock.local_addr()?;
+        let recv_in = recv_socket.local_addr()?;
 
         // todo: maybe specify a way in the config to send from particular socket
         // bind the output socket; we dont care where it comes from
-        let remote_sock = UdpSocket::bind("0.0.0.0:0").await?;
-
-        Ok(Connection {
-            send_socket: remote_sock,
+        let send_socket = UdpSocket::bind("0.0.0.0:0").await?;
+        let send_socket = Arc::new(send_socket);
+        
+        let mut connection = Connection {
+            send_socket,
             send_to,
 
-            recv_from: receive_from,
-            recv_socket: local_sock,
+            recv_in,
+            recv_socket,
+
+            origin_addr,
+            recv_handle: None,
+        };
+        
+        debug!("INIT; SEND CONNECTION: {:?} -> {:?}", connection.send_to, connection.recv_in);
+        // todo: add this handle to the error watcher to await
+        // begin receiving
+        connection.recv_handle = Some(Arc::new(connection.recv()));
+        
+        Ok(connection)
+    }
+    
+    fn recv(&self) -> JoinHandle<io::Result<()>> {
+        let connection = self.clone();
+        
+        tokio::spawn(async move {
+            debug!("INIT; CONNECTION: {:?} -> {:?}", connection.send_to, connection.origin_addr);
+            // todo: buf pool
+            let mut buf = BytesMut::with_capacity(SOCK_BUFSIZ);
+            
+            loop {
+                connection.send_socket.readable().await?;
+                
+                let (length, from) = match connection.send_socket.try_recv_buf_from(&mut buf) {
+                    Ok((length, from)) => (length, from),
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                    Err(e) => return Err(e),
+                };
+                
+                // drop the packet if it is not from the client
+                if from != connection.send_to {
+                    debug!("DROP; FROM {:?}", connection.send_to);
+                    continue;
+                }
+                debug!("RECV; LOCATION {:?}", connection.send_to);
+                
+                let bytes = &buf[..length];
+                let sent_size = connection.recv_socket.send_to(bytes, connection.origin_addr).await?;
+                debug!("SENT; LOCATION: {:?}, LEN: {sent_size}", connection.recv_in);
+                
+                buf.resize(SOCK_BUFSIZ, 0x0);
+            }
         })
+    }
+    
+    pub fn recv_handle(&self) -> Arc<JoinHandle<io::Result<()>>> {
+        self.recv_handle.clone().unwrap()
     }
 
     async fn send(&self, bytes: &[u8]) -> io::Result<usize> {
         self.send_socket.send_to(bytes, self.send_to).await
     }
+    
 }
 
 struct Stream {
@@ -242,7 +298,7 @@ impl Stream {
         let connection: Arc<Connection> = if let Some(active) = self.active.get(&send_to) {
             active.value().clone()
         } else {
-            let connection = Connection::new(Arc::clone(&self.socket), *send_to).await?;
+            let connection = Connection::new(sent_from, Arc::clone(&self.socket), *send_to).await?;
             let connection: Arc<Connection> = Arc::new(connection);
 
             self.active.insert(sent_from, connection.clone());
@@ -251,11 +307,13 @@ impl Stream {
 
         // send the bytes to the server
         let sent_size = connection.send(bytes).await?;
-        debug!("SENT; LOCATION: {:?}, LEN: {sent_size}", connection.recv_from);
+        debug!("SENT; LOCATION: {:?}, LEN: {sent_size}", connection.recv_in);
 
         Ok(())
     }
 }
+
+const SOCK_BUFSIZ: usize = 2048;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -267,14 +325,13 @@ async fn main() -> io::Result<()> {
     let stream = Stream::bind("127.0.0.1:5000").await?
         .route("127.0.0.1:7000".parse().unwrap(), "127.0.0.1:6000".parse().unwrap());
 
-    let mut buf = BytesMut::with_capacity(2048); // this is slow
+    let mut buf = BytesMut::with_capacity(SOCK_BUFSIZ); // this is slow
 
     loop {
         stream.socket().readable().await?;
 
-        let udp_socket = stream.socket();
         // todo: cache buffer size to determine when to shrink
-        let (length, from) = match udp_socket.try_recv_buf_from(&mut buf) {
+        let (length, from) = match stream.socket().try_recv_buf_from(&mut buf) {
             Ok((length, from)) => (length, from),
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
             Err(e) => return Err(e),
@@ -284,7 +341,7 @@ async fn main() -> io::Result<()> {
 
         stream.send(from, &buf[..length]).await?;
 
-        buf.resize(2048, 0x0); // shrink buffer incase it has been expanded
+        buf.resize(SOCK_BUFSIZ, 0x0); // shrink buffer incase it has been expanded
     }
 
     Ok(())
