@@ -4,23 +4,25 @@ mod args;
 mod configure;
 mod port_range;
 mod router;
+mod pool;
+mod timer;
 
 use crate::args::Cli;
 use crate::configure::Config;
 use bytes::BytesMut;
 use clap::Parser;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use futures::future::join_all;
 use log::{debug, error, info, warn};
 use std::collections::{HashMap, HashSet};
-use std::hash::Hash;
+use std::hash::{Hash, Hasher};
 use std::mem::MaybeUninit;
 use std::net::{AddrParseError, SocketAddr, UdpSocket as _DontUseUdpSocket};
 use std::ops::Deref;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::net::{ToSocketAddrs, UdpSocket};
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, Semaphore};
 use tokio::{io, task, time};
 
 use dashmap::mapref::one::Ref;
@@ -29,43 +31,9 @@ use std::time::Duration;
 use libc::time;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, Interval};
+use pool::{ConnectionPool};
+use crate::pool::get_connection_pool;
 use crate::router::Router;
-
-/// bind to all required sockets concurrently
-async fn bind_sockets(socket_addrs: HashSet<SocketAddr>) -> Vec<Arc<UdpSocket>> {
-    let tasks: Vec<_> = socket_addrs
-        .into_iter()
-        .map(|addr| {
-            let addr_clone = addr.clone();
-            task::spawn(async move {
-                debug!("attempting to bind to socket: {}", addr_clone);
-                match UdpSocket::bind(addr_clone).await {
-                    Ok(socket) => Ok(Arc::new(socket)),
-                    Err(error) => Err((addr_clone, error)),
-                }
-            })
-        })
-        .collect();
-
-    let results = join_all(tasks).await;
-    let mut bound_sockets = Vec::new();
-
-    for task_result in results {
-        match task_result {
-            Ok(Ok(socket)) => {
-                bound_sockets.push(socket);
-            }
-            Ok(Err((addr, error))) => {
-                error!("failed to bind to socket: {} > {}", addr, error);
-            }
-            Err(join_error) => {
-                error!("bind task failed with error > {}", join_error);
-            }
-        }
-    }
-
-    bound_sockets
-}
 
 #[derive(Clone)]
 struct Connection {
@@ -75,10 +43,32 @@ struct Connection {
     recv_socket: Arc<UdpSocket>, // mark unused
     recv_in: SocketAddr,
 
-
     origin_addr: SocketAddr,
-    recv_handle: Option<Arc<JoinHandle<io::Result<()>>>>
+
+    recv_handle: Option<Arc<JoinHandle<io::Result<()>>>>,
+
+    last_used: u32,
+
+    connection_pool: Arc<ConnectionPool>,
     // maybe store a ref to the buffer pool
+}
+
+impl PartialEq for Connection {
+    fn eq(&self, other: &Self) -> bool {
+        self.send_to == other.send_to &&
+        self.recv_in == other.recv_in &&
+        self.origin_addr == other.origin_addr
+    }
+}
+
+impl Eq for Connection {}
+
+impl Hash for Connection {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.send_to.hash(state);
+        self.recv_in.hash(state);
+        self.origin_addr.hash(state);
+    }
 }
 
 // maybe will need a list of valid return addresses
@@ -94,6 +84,8 @@ impl Connection {
         debug!("BOUND TO SOCKET {:?}", send_socket.local_addr()?);
 
         let send_socket = Arc::new(send_socket);
+        let connection_pool = get_connection_pool();
+        let last_used = connection_pool.time();
         
         let mut connection = Connection {
             send_socket,
@@ -104,6 +96,9 @@ impl Connection {
 
             origin_addr,
             recv_handle: None,
+            
+            last_used,
+            connection_pool,
         };
         
         debug!("INIT; SEND CONNECTION: {:?} -> {:?}", connection.send_to, connection.recv_in);
@@ -154,7 +149,18 @@ impl Connection {
     async fn send(&self, bytes: &[u8]) -> io::Result<usize> {
         self.send_socket.send_to(bytes, self.send_to).await
     }
+
+    fn terminate(self) {
+        self.recv_handle.unwrap().abort()
+    }
     
+    pub(crate) fn timeout(&self) -> u32 {
+        30
+    }
+    
+    pub(crate) fn last_active(&self) -> u32 {
+        self.last_used
+    }
 }
 
 struct Stream {
@@ -207,6 +213,9 @@ impl Stream {
         } else {
             let connection = Connection::new(sent_from, Arc::clone(&self.socket), *send_to).await?;
             let connection: Arc<Connection> = Arc::new(connection);
+            
+            let connection_pool = get_connection_pool();
+            connection_pool.add_connection(connection.clone());
 
             self.active.insert(*send_to, connection.clone());
             connection
@@ -270,71 +279,25 @@ impl StreamRouter {
         self.routes.get(addr)
     }
 }
-struct ConnectionPool {
-    active: Vec<u32>,
-    elapsed: Arc<AtomicU32>,
-    start: Instant,
-    timer_handle: Option<JoinHandle<()>>,
-}
 
-impl ConnectionPool {
-    fn new() -> Self {
-        // put the AtomicU32 in an Arc
-        let elapsed = Arc::new(AtomicU32::new(0));
-
-        // clone the Arc so we can move it into the async block
-        let elapsed_clone = Arc::clone(&elapsed);
-
-        // spawn the timer task
-        let timer_handle = Some(task::spawn(async move {
-            let mut interval = time::interval(Duration::from_secs(1));
-            loop {
-                interval.tick().await;
-                // update the AtomicU32 every second
-                elapsed_clone.fetch_add(1, Ordering::Relaxed);
-            }
-        }));
-
-        Self {
-            active: vec![],
-            elapsed,
-            start: Instant::now(),
-            timer_handle,
-        }
-    }
-
-    #[inline(always)]
-    pub fn time(&self) -> u32 {
-        self.elapsed.load(Ordering::Relaxed)
-    }
-}
-
-impl Drop for ConnectionPool {
-    fn drop(&mut self) {
-        if let Some(handle) = self.timer_handle.take() {
-            handle.abort();
-        }
-    }
-}
-
-const SOCK_BUFFER_SIZE: usize = 4096;
+pub const SOCK_BUFFER_SIZE: usize = 4096;
 
 #[tokio::main]
-async fn main() -> io::Result<()> {
+async fn main() -> std::io::Result<()> {
     // start logging
     env_logger::Builder::new()
         .filter_level(log::LevelFilter::Debug)
         .init();
-    
+
     info!("SERVER STARTING");
-    
+
     let connection_pool = Arc::new(ConnectionPool::new());
-    
+
     let router = StreamRouter::recv("127.0.0.1:5000".parse().unwrap())
         .route("127.0.0.1:7000".parse().unwrap(), "127.0.0.1:6000".parse().unwrap());
-    
+
     let stream = Stream::bind(router).await?;
-    
+
     stream.listen().await??;
 
     Ok(())
