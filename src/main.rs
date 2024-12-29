@@ -17,14 +17,18 @@ use std::hash::Hash;
 use std::mem::MaybeUninit;
 use std::net::{AddrParseError, SocketAddr, UdpSocket as _DontUseUdpSocket};
 use std::ops::Deref;
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio::net::{ToSocketAddrs, UdpSocket};
 use tokio::sync::Semaphore;
-use tokio::{io, task};
+use tokio::{io, task, time};
 
 use dashmap::mapref::one::Ref;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::time::Duration;
+use libc::time;
 use tokio::task::JoinHandle;
+use tokio::time::{Instant, Interval};
 use crate::router::Router;
 
 /// bind to all required sockets concurrently
@@ -266,6 +270,52 @@ impl StreamRouter {
         self.routes.get(addr)
     }
 }
+struct ConnectionPool {
+    active: Vec<u32>,
+    elapsed: Arc<AtomicU32>,
+    start: Instant,
+    timer_handle: Option<JoinHandle<()>>,
+}
+
+impl ConnectionPool {
+    fn new() -> Self {
+        // put the AtomicU32 in an Arc
+        let elapsed = Arc::new(AtomicU32::new(0));
+
+        // clone the Arc so we can move it into the async block
+        let elapsed_clone = Arc::clone(&elapsed);
+
+        // spawn the timer task
+        let timer_handle = Some(task::spawn(async move {
+            let mut interval = time::interval(Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                // update the AtomicU32 every second
+                elapsed_clone.fetch_add(1, Ordering::Relaxed);
+            }
+        }));
+
+        Self {
+            active: vec![],
+            elapsed,
+            start: Instant::now(),
+            timer_handle,
+        }
+    }
+
+    #[inline(always)]
+    pub fn time(&self) -> u32 {
+        self.elapsed.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for ConnectionPool {
+    fn drop(&mut self) {
+        if let Some(handle) = self.timer_handle.take() {
+            handle.abort();
+        }
+    }
+}
 
 const SOCK_BUFFER_SIZE: usize = 4096;
 
@@ -276,6 +326,10 @@ async fn main() -> io::Result<()> {
         .filter_level(log::LevelFilter::Debug)
         .init();
     
+    info!("SERVER STARTING");
+    
+    let connection_pool = Arc::new(ConnectionPool::new());
+    
     let router = StreamRouter::recv("127.0.0.1:5000".parse().unwrap())
         .route("127.0.0.1:7000".parse().unwrap(), "127.0.0.1:6000".parse().unwrap());
     
@@ -285,6 +339,3 @@ async fn main() -> io::Result<()> {
 
     Ok(())
 }
-/*
-
- */
