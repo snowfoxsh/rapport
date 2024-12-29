@@ -15,7 +15,7 @@ use log::{debug, error, info, warn};
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::mem::MaybeUninit;
-use std::net::{SocketAddr, UdpSocket as _DontUseUdpSocket};
+use std::net::{AddrParseError, SocketAddr, UdpSocket as _DontUseUdpSocket};
 use std::ops::Deref;
 use std::sync::Arc;
 use tokio::net::{ToSocketAddrs, UdpSocket};
@@ -25,6 +25,7 @@ use tokio::{io, task};
 use dashmap::mapref::one::Ref;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::task::JoinHandle;
+use crate::router::Router;
 
 /// bind to all required sockets concurrently
 async fn bind_sockets(socket_addrs: HashSet<SocketAddr>) -> Vec<Arc<UdpSocket>> {
@@ -108,11 +109,11 @@ impl Connection {
         
         Ok(connection)
     }
-    
+   
     fn recv(&self) -> JoinHandle<io::Result<()>> {
         let connection = self.clone();
         
-        tokio::spawn(async move {
+        task::spawn(async move {
             debug!("INIT; CONNECTION: {:?} -> {:?}", connection.send_to, connection.origin_addr);
             // todo: buf pool
             let mut buf = BytesMut::with_capacity(SOCK_BUFFER_SIZE);
@@ -155,39 +156,30 @@ impl Connection {
 struct Stream {
     // Arc<T> because we need to share to timeout thread
     active: Arc<DashMap<SocketAddr, Arc<Connection>>>, // active connections to the socket
-    routes: DashMap<SocketAddr, SocketAddr>,           // C:x -> S:y
+    // routes: DashMap<SocketAddr, SocketAddr>,           // C:x -> S:y
+    router: StreamRouter,
     socket: Arc<UdpSocket>,
 }
 
 impl Stream {
-    pub async fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Stream> {
-        let socket = UdpSocket::bind(addr).await?;
+    pub async fn bind(router: StreamRouter) -> io::Result<Stream> {
+        let socket = UdpSocket::bind(router.recv).await?;
         let socket = Arc::new(socket);
 
         Ok(Self {
             socket,
             active: Arc::new(DashMap::new()),
-            routes: DashMap::new(), // start with empty routing table
+            router,
         })
     }
 
-    pub fn add_route<A: Into<SocketAddr>>(&mut self, from_addr: A, to_addr: A) {
-        // create the route
-        self.routes.insert(from_addr.into(), to_addr.into());
-    }
 
-    pub fn route(mut self, from_addr: SocketAddr, to_addr: SocketAddr) -> Self {
-        self.add_route(from_addr, to_addr);
-        self
-    }
 
     pub fn socket(&self) -> &UdpSocket {
         self.socket.as_ref()
     }
 
-    pub fn solve_route(&self, addr: &SocketAddr) -> Option<Ref<'_, SocketAddr, SocketAddr>> {
-        self.routes.get(addr)
-    }
+
 
     pub async fn send(&self, sent_from: SocketAddr, bytes: &[u8]) -> io::Result<()> {
         // lookup the correct route
@@ -199,7 +191,7 @@ impl Stream {
         // send from connection socket
 
         // lookup the correct route
-        let Some(send_to) = self.solve_route(&sent_from) else {
+        let Some(send_to) = self.router.solve_route(&sent_from) else {
             // drop the packet
             debug!("DROP; FROM {:?}", sent_from);
             return Ok(());
@@ -222,6 +214,57 @@ impl Stream {
 
         Ok(())
     }
+
+    fn listen(self) -> JoinHandle<io::Result<()>> {
+        
+        task::spawn( async move {
+            debug!("LISTEN; {}", self.router.recv);
+            let mut buf = BytesMut::with_capacity(SOCK_BUFFER_SIZE);
+
+            loop {
+                self.socket().readable().await?;
+
+                // todo: cache buffer size to determine when to shrink
+                let (length, from) = match self.socket().try_recv_buf_from(&mut buf) {
+                    Ok((length, from)) => (length, from),
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                    Err(e) => return Err(e),
+                };
+
+                debug!("RECV; FROM {:?}, LEN: {length}", from);
+
+                self.send(from, &buf[..length]).await?;
+            }
+        })
+    }
+}
+
+struct StreamRouter {
+    recv: SocketAddr,
+    routes: DashMap<SocketAddr, SocketAddr>,
+}
+
+impl StreamRouter {
+    fn recv(addr: SocketAddr) -> Self {
+        Self {
+            recv: addr.into(),
+            routes: DashMap::new(),
+        }
+    }
+    
+    pub fn add_route(&mut self, from_addr: SocketAddr, to_addr: SocketAddr) {
+        // create the route
+        self.routes.insert(from_addr, to_addr);
+    }
+
+    pub fn route(mut self, from_addr: SocketAddr, to_addr: SocketAddr) -> Self {
+        self.add_route(from_addr, to_addr);
+        self
+    }
+
+    pub fn solve_route(&self, addr: &SocketAddr) -> Option<Ref<'_, SocketAddr, SocketAddr>> {
+        self.routes.get(addr)
+    }
 }
 
 const SOCK_BUFFER_SIZE: usize = 4096;
@@ -230,31 +273,18 @@ const SOCK_BUFFER_SIZE: usize = 4096;
 async fn main() -> io::Result<()> {
     // start logging
     env_logger::Builder::new()
-        .filter_level(log::LevelFilter::Info)
+        .filter_level(log::LevelFilter::Debug)
         .init();
     
-    let stream = Stream::bind("127.0.0.1:5000").await?
+    let router = StreamRouter::recv("127.0.0.1:5000".parse().unwrap())
         .route("127.0.0.1:7000".parse().unwrap(), "127.0.0.1:6000".parse().unwrap());
-
-    let mut buf = BytesMut::with_capacity(SOCK_BUFFER_SIZE); 
-
-    loop {
-        stream.socket().readable().await?;
-
-        // todo: cache buffer size to determine when to shrink
-        let (length, from) = match stream.socket().try_recv_buf_from(&mut buf) {
-            Ok((length, from)) => (length, from),
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-            Err(e) => return Err(e),
-        };
-        
-        debug!("RECV; FROM {:?}, LEN: {length}", from);
-
-        stream.send(from, &buf[..length]).await?;
-
-        buf.resize(SOCK_BUFFER_SIZE, 0x0); // shrink buffer incase it has been expanded
-    }
+    
+    let stream = Stream::bind(router).await?;
+    
+    stream.listen().await??;
 
     Ok(())
 }
+/*
 
+ */

@@ -380,6 +380,7 @@ dependencies = [
  "rlimit",
  "serde",
  "serde_derive",
+ "socket2",
  "tokio",
  "toml",
 ]
