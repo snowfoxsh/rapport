@@ -7,7 +7,6 @@ mod router;
 mod timer;
 
 use bytes::BytesMut;
-use clap::Parser;
 use dashmap::DashMap;
 use log::{debug, info};
 use std::hash::{Hash, Hasher};
