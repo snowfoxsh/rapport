@@ -1,4 +1,3 @@
-use rlimit::{increase_nofile_limit, setrlimit, Resource};
 
 mod args;
 mod configure;
@@ -7,33 +6,21 @@ mod port_range;
 mod router;
 mod timer;
 
-use crate::args::Cli;
-use crate::configure::Config;
 use bytes::BytesMut;
 use clap::Parser;
-use dashmap::{DashMap, DashSet};
-use futures::future::join_all;
-use log::{debug, error, info, warn};
-use std::collections::{HashMap, HashSet};
+use dashmap::DashMap;
+use log::{debug, info};
 use std::hash::{Hash, Hasher};
-use std::mem::MaybeUninit;
-use std::net::{AddrParseError, SocketAddr, UdpSocket as _DontUseUdpSocket};
-use std::ops::Deref;
-use std::pin::Pin;
+use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::net::{ToSocketAddrs, UdpSocket};
-use tokio::sync::{Mutex, Semaphore};
-use tokio::{io, task, time};
+use tokio::net::UdpSocket;
+use tokio::{io, task};
 
 use crate::pool::get_connection_pool;
-use crate::router::Router;
 use dashmap::mapref::one::Ref;
-use libc::time;
 use pool::ConnectionPool;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::task::JoinHandle;
-use tokio::time::{Instant, Interval};
 
 #[derive(Clone)]
 struct Connection {
