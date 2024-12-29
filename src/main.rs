@@ -23,33 +23,8 @@ use tokio::sync::Semaphore;
 use tokio::{io, task};
 
 use dashmap::mapref::one::Ref;
-use std::os::unix::io::AsRawFd;
-use futures::TryStreamExt;
-use tokio::io::Interest;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::task::JoinHandle;
-// use crate::router::Router;
-
-/// Sets the `IP_TRANSPARENT` option for a given `UdpSocket`
-fn set_ip_transparent(socket: &UdpSocket) -> io::Result<()> {
-    let fd = socket.as_raw_fd();
-    let opt_val: libc::c_int = 1;
-
-    unsafe {
-        let result = libc::setsockopt(
-            fd,
-            libc::SOL_IP,
-            libc::IP_TRANSPARENT,
-            &opt_val as *const _ as *const libc::c_void,
-            std::mem::size_of_val(&opt_val) as libc::socklen_t,
-        );
-        if result != 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
-
-    Ok(())
-}
-
 
 /// bind to all required sockets concurrently
 async fn bind_sockets(socket_addrs: HashSet<SocketAddr>) -> Vec<Arc<UdpSocket>> {
@@ -87,72 +62,6 @@ async fn bind_sockets(socket_addrs: HashSet<SocketAddr>) -> Vec<Arc<UdpSocket>> 
     bound_sockets
 }
 
-/// handles forwarding packets for a given socket
-async fn forward_task(
-    socket: Arc<UdpSocket>,
-    forward_routes: Arc<HashMap<SocketAddr, SocketAddr>>,
-    backward_routes: Arc<HashMap<SocketAddr, SocketAddr>>,
-    buf_pool: Arc<Semaphore>,
-) -> io::Result<()> {
-    let local_addr = socket.local_addr()?;
-    info!("Listening on {}", local_addr);
-
-    loop {
-        // Acquire a buffer permit
-        let _permit = buf_pool.acquire().await.unwrap();
-        let mut buf = BytesMut::with_capacity(64 * 1024);
-        buf.resize(64 * 1024, 0);
-
-        let (len, src_addr) = match socket.recv_from(&mut buf).await {
-            Ok(res) => res,
-            Err(e) => {
-                warn!("Error receiving from {}: {}", local_addr, e);
-                continue;
-            }
-        };
-
-        // 16 entries
-
-        debug!("Received ");
-
-        buf.truncate(len);
-
-        // Determine packet direction (local -> remote or remote -> local)
-        if let Some(remote_addr) = forward_routes.get(&local_addr) {
-            if src_addr == *remote_addr {
-                // Packet is remote -> local
-                if let Some(local_addr) = backward_routes.get(remote_addr) {
-                    // Forward to the local address
-                    if let Err(e) = socket.send_to(&buf, *local_addr).await {
-                        warn!("Error forwarding remote -> local packet: {}", e);
-                    }
-                } else {
-                    debug!(
-                        "No matching local route for remote response from {}",
-                        src_addr
-                    );
-                }
-            } else {
-                // Packet is local -> remote
-                if let Err(e) = socket.send_to(&buf, *remote_addr).await {
-                    error!("Error forwarding local -> remote packet: {}", e);
-                }
-            }
-        } else {
-            debug!("No route found for local address: {}", local_addr);
-        }
-    }
-}
-
-fn set_unlimited_resource() -> io::Result<()> {
-    // think this should work
-    info!(
-        "increase_nofile_limit reported: {}",
-        increase_nofile_limit(u64::MAX - 1)?
-    );
-    Ok(())
-}
-
 #[derive(Clone)]
 struct Connection {
     send_socket: Arc<UdpSocket>,
@@ -166,8 +75,8 @@ struct Connection {
     recv_handle: Option<Arc<JoinHandle<io::Result<()>>>>
     // maybe store a ref to the buffer pool
 }
-// maybe will need a list of valid return addresses
 
+// maybe will need a list of valid return addresses
 impl Connection {
     async fn new(origin_addr: SocketAddr, recv_socket: Arc<UdpSocket>, send_to: SocketAddr) -> io::Result<Connection> {
         // get the address of the local socket
@@ -177,6 +86,8 @@ impl Connection {
         // todo: maybe specify a way in the config to send from particular socket
         // bind the output socket; we dont care where it comes from
         let send_socket = UdpSocket::bind("0.0.0.0:0").await?;
+        debug!("BOUND TO SOCKET {:?}", send_socket.local_addr()?);
+
         let send_socket = Arc::new(send_socket);
         
         let mut connection = Connection {
@@ -204,7 +115,7 @@ impl Connection {
         tokio::spawn(async move {
             debug!("INIT; CONNECTION: {:?} -> {:?}", connection.send_to, connection.origin_addr);
             // todo: buf pool
-            let mut buf = BytesMut::with_capacity(SOCK_BUFSIZ);
+            let mut buf = BytesMut::with_capacity(SOCK_BUFFER_SIZE);
             
             loop {
                 connection.send_socket.readable().await?;
@@ -226,7 +137,7 @@ impl Connection {
                 let sent_size = connection.recv_socket.send_to(bytes, connection.origin_addr).await?;
                 debug!("SENT; LOCATION: {:?}, LEN: {sent_size}", connection.recv_in);
                 
-                buf.resize(SOCK_BUFSIZ, 0x0);
+                buf.resize(SOCK_BUFFER_SIZE, 0x0);
             }
         })
     }
@@ -290,7 +201,7 @@ impl Stream {
         // lookup the correct route
         let Some(send_to) = self.solve_route(&sent_from) else {
             // drop the packet
-            debug!("DROP");
+            debug!("DROP; FROM {:?}", sent_from);
             return Ok(());
         };
 
@@ -301,7 +212,7 @@ impl Stream {
             let connection = Connection::new(sent_from, Arc::clone(&self.socket), *send_to).await?;
             let connection: Arc<Connection> = Arc::new(connection);
 
-            self.active.insert(sent_from, connection.clone());
+            self.active.insert(*send_to, connection.clone());
             connection
         };
 
@@ -313,19 +224,19 @@ impl Stream {
     }
 }
 
-const SOCK_BUFSIZ: usize = 2048;
+const SOCK_BUFFER_SIZE: usize = 4096;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
     // start logging
     env_logger::Builder::new()
-        .filter_level(log::LevelFilter::Debug)
+        .filter_level(log::LevelFilter::Info)
         .init();
     
     let stream = Stream::bind("127.0.0.1:5000").await?
         .route("127.0.0.1:7000".parse().unwrap(), "127.0.0.1:6000".parse().unwrap());
 
-    let mut buf = BytesMut::with_capacity(SOCK_BUFSIZ); // this is slow
+    let mut buf = BytesMut::with_capacity(SOCK_BUFFER_SIZE); 
 
     loop {
         stream.socket().readable().await?;
@@ -336,71 +247,14 @@ async fn main() -> io::Result<()> {
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
             Err(e) => return Err(e),
         };
-
-        debug!("RECV; FROM {:?}, LEN: {length}, DATA {:?}", from, &buf[..length]);
+        
+        debug!("RECV; FROM {:?}, LEN: {length}", from);
 
         stream.send(from, &buf[..length]).await?;
 
-        buf.resize(SOCK_BUFSIZ, 0x0); // shrink buffer incase it has been expanded
+        buf.resize(SOCK_BUFFER_SIZE, 0x0); // shrink buffer incase it has been expanded
     }
 
     Ok(())
 }
 
-// todo: test a bunch of packet sizes | from a remote host
-
-// map error case
-
-// #[tokio::main(flavor = "multi_thread", worker_threads = 10)]
-// async fn main() -> io::Result<()> {
-//     // env_logger::init();
-//     env_logger::Builder::new()
-//         .filter_level(log::LevelFilter::Debug)
-//         .init();
-//
-//     let cli = Cli::parse();
-//
-//     let config = Config::load_file(cli.config_file).await?;
-//     let router = config.router();
-//
-//     // by default yes
-//     if cli.unlimited_resource {
-//         set_unlimited_resource()?;
-//     }
-//
-//     debug!("found routes: forward: {}, backwards: {}", router.get_forward_routes().len(), router.get_backward_routes().len());
-//
-//     // bind all required sockets
-//     let sockets = bind_sockets(Router::required_sockets(router.get_forward_routes())).await;
-//     debug!("bound {} sockets", sockets.len());
-//
-//     info!("udp proxy server starting");
-//     // shared state
-//
-//     // let router_map = Arc::new(router.to_routes()); // Own the rooter map. It is now immutable
-//
-//     let (forwards_routes, backwards_routes) = router.to_forward_backward_routes();
-//     let (forwards_routes, backwards_routes) = (Arc::new(forwards_routes), Arc::new(backwards_routes));
-//
-//     // let client_map = Arc::new(DashMap::<SocketAddr, SocketAddr>::new());
-//     let buf_pool = Arc::new(Semaphore::new(config.buffer_pool_permits)); // Buffer pool
-//
-//     // spawn a forwarding task for each socket
-//     for socket in sockets {
-//         let forwards_routes = Arc::clone(&forwards_routes);
-//         let backwards_routes = Arc::clone(&forwards_routes);
-//         // let client_map = Arc::clone(&client_map);
-//         let buf_pool = Arc::clone(&buf_pool);
-//         tokio::spawn(async move {
-//             if let Err(e) = forward_task(socket, forwards_routes, backwards_routes, buf_pool).await {
-//                 warn!("Forward task error: {}", e);
-//             }
-//         });
-//     }
-//
-//     // the main task can now wait forever
-//     loop {
-//         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-//     }
-// }
-// mb proposal to type labels
