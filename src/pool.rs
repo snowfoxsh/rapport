@@ -37,7 +37,7 @@ impl ConnectionPool {
 
         let pool_ref = Arc::clone(&pool);
         let outer_map: DashMap<String, DashMap<String, i32>> = DashMap::new();
-        
+
         // spawn local here
         tokio::spawn(async move {
             let timer = &pool_ref.timer;
@@ -63,23 +63,26 @@ impl ConnectionPool {
                     // active.remove_if(connection.key(), |con| { !time - con.last_active() > con.timeout() })
                     //     .and_then(|c| {shutdown_count += 1; Some(c)});
                     // debug!("LAST ACTIVE: {}", connection.last_active())
-                    
+
                     // kill the connection if it has not been used recently
                     if time - connection.last_active() > connection.timeout() {
-                        // remove it from the parent active pool
+                        // first stop the recv task
+                        connection.recv_handle.as_ref().unwrap().abort();
+                        
+                        // then remove it from the parent active pool
                         connection.parent_active_pool.remove(&connection.send_to);
                         
                         // we have to remove it later because of deadlock i think
                         to_remove.push(connection.key().clone());
-                        
+
                         shutdown_count += 1;
                     }
                 });
-                
+
                 for connection in to_remove {
                     active.remove(&connection);
                 }
-                
+
 
                 debug!("FINISHED CLEANUP; SHUTDOWN CONNECTIONS: {}", shutdown_count);
             }
@@ -88,12 +91,12 @@ impl ConnectionPool {
 
         pool
     }
-    
+
     #[inline(always)]
     pub fn time(&self) -> u32 {
         self.timer.time()
     }
-    
+
     pub fn add_connection(&self, connection: Arc<Connection>) -> bool {
         self.active.insert(connection)
     }
