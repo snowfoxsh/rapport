@@ -3,6 +3,7 @@
 import socket
 import argparse
 import logging
+import struct
 import time
 
 def parse_arguments():
@@ -61,30 +62,57 @@ def setup_logging():
             logging.StreamHandler()
         ]
     )
+def udp_sender(source_ip, source_port, dest_ip, dest_port, packet_size, packet_count, timeout, packets_per_second):
+    """
+    Sends UDP packets filled with sequential numbers from the specified source to the destination at a controlled rate.
+    Each packet contains a 4-byte sequence number followed by padding.
+    """
+    # Validate packet size
+    if packet_size < 4:
+        logging.error("Packet size must be at least 4 bytes to accommodate the sequence number.")
+        return
 
-def udp_sender(source_ip, source_port, dest_ip, dest_port, packet_size, packet_count, timeout):
-    """
-    Sends UDP packets filled with zero bytes from the specified source to the destination.
-    """
     # Create UDP socket
     sender_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sender_socket.bind((source_ip, source_port))
     sender_socket.settimeout(timeout)
     logging.info(f"Sender socket bound to {source_ip}:{source_port}")
     logging.info(f"Sending UDP packets to {dest_ip}:{dest_port}")
-    logging.info(f"Packet size: {packet_size} bytes, Packet count: {packet_count}\n")
+    logging.info(f"Packet size: {packet_size} bytes, Packet count: {packet_count}")
+    logging.info(f"Desired sending rate: {packets_per_second} packets/second\n")
 
-    packet_data = b'\0' * packet_size  # Data to send in each packet
+    # Calculate time between packets
+    interval = 1.0 / packets_per_second  # Time in seconds
 
     start_time = time.time()
+    next_send_time = start_time
 
     try:
         for i in range(1, packet_count + 1):
             try:
+                # Prepare packet with sequence number
+                sequence_number = struct.pack('!I', i)
+                padding_size = packet_size - 4
+                padding_data = b'\0' * padding_size
+                packet_data = sequence_number + padding_data
+
+                # Send the packet
                 sender_socket.sendto(packet_data, (dest_ip, dest_port))
+
+                # Log progress every 100,000 packets
                 if i % 100000 == 0:
                     elapsed = time.time() - start_time
                     logging.info(f"Sent {i} packets in {elapsed:.2f} seconds.")
+
+                # Calculate the next send time
+                next_send_time += interval
+                current_time = time.time()
+                sleep_duration = next_send_time - current_time
+                if sleep_duration > 0:
+                    time.sleep(sleep_duration)
+                else:
+                    # If we're behind schedule, skip sleeping to catch up
+                    next_send_time = current_time
             except Exception as e:
                 logging.error(f"Error sending packet {i}: {e}")
                 break
@@ -119,8 +147,11 @@ def main():
         args.dest_port,
         args.packet_size,
         args.packet_count,
-        args.timeout
+        args.timeout,
+        100_000_000
     )
 
 if __name__ == "__main__":
     main()
+
+

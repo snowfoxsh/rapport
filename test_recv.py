@@ -30,7 +30,7 @@ def parse_arguments():
     parser.add_argument(
         '--timeout',
         type=int,
-        default=2,
+        default=1,
         help='Socket timeout in seconds after last received packet (default: 2)'
     )
     return parser.parse_args()
