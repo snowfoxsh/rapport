@@ -156,9 +156,6 @@ impl Connection {
         self.send_socket.send_to(bytes, self.send_to).await
     }
 
-    fn terminate(self) {
-        self.recv_handle.unwrap().abort()
-    }
 
     pub(crate) fn timeout(&self) -> u32 {
         4
@@ -166,6 +163,18 @@ impl Connection {
 
     pub(crate) fn last_active(&self) -> u32 {
         self.last_used.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        // im not quite sure why drop sometimes gets called twice
+        if let Some(handle) = &self.recv_handle {
+            if !handle.is_finished() {
+                handle.abort();
+                debug!("CONNECTION DROPPED");
+            }
+        }
     }
 }
 
@@ -181,10 +190,14 @@ impl Stream {
     pub async fn bind(router: StreamRouter) -> io::Result<Stream> {
         let socket = UdpSocket::bind(router.recv).await?;
         let socket = Arc::new(socket);
+        
+        let active = Arc::new(DashMap::new());
+        
+        get_connection_pool().add(active.clone()).await;
 
         Ok(Self {
             socket,
-            active: Arc::new(DashMap::new()),
+            active,
             router,
         })
     }
@@ -220,8 +233,8 @@ impl Stream {
             let connection = Connection::new(sent_from, Arc::clone(&self.socket), *send_to, self.active.clone()).await?;
             let connection: Arc<Connection> = Arc::new(connection);
 
-            let connection_pool = get_connection_pool();
-            connection_pool.add_connection(connection.clone());
+            // let connection_pool = get_connection_pool();
+            // connection_pool.add_connection(connection.clone());
 
             self.active.insert(*send_to, connection.clone());
             connection
@@ -297,7 +310,7 @@ async fn main() -> std::io::Result<()> {
 
     info!("SERVER STARTING");
 
-    let connection_pool = Arc::new(ConnectionPool::new());
+    // let connection_pool = Arc::new(ConnectionPool::new());
 
     let router = StreamRouter::recv("127.0.0.1:5000".parse().unwrap())
         .route("127.0.0.1:7000".parse().unwrap(), "127.0.0.1:6000".parse().unwrap());

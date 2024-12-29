@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 # network
 tokio = { version = "1.42.0", features = ["full"] }
+#crossbeam-queue = "0.3.12"
 dashmap = "6.1.0"
 futures = "0.3.31"
 socket2 = "0.5.8"
