@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use tokio::net::UdpSocket;
 use futures::future::join_all;
-use dashmap::DashSet;
+use dashmap::{DashMap, DashSet};
 use tokio::time;
 use std::time::Duration;
 use tokio::time::Instant;
@@ -36,7 +36,8 @@ impl ConnectionPool {
         });
 
         let pool_ref = Arc::clone(&pool);
-
+        let outer_map: DashMap<String, DashMap<String, i32>> = DashMap::new();
+        
         // spawn local here
         tokio::spawn(async move {
             let timer = &pool_ref.timer;
@@ -56,11 +57,29 @@ impl ConnectionPool {
                 let time = timer.time();
 
                 let mut shutdown_count = 0;
+                let mut to_remove = vec![];
                 pool_ref.active.iter().for_each(|connection| {
                     // if the connection has been dead for longer than the timeout
-                    active.remove_if(connection.key(), |con| { time - con.last_active() > con.timeout() })
-                        .and_then(|c| {shutdown_count += 1; Some(c)});
+                    // active.remove_if(connection.key(), |con| { !time - con.last_active() > con.timeout() })
+                    //     .and_then(|c| {shutdown_count += 1; Some(c)});
+                    // debug!("LAST ACTIVE: {}", connection.last_active())
+                    
+                    // kill the connection if it has not been used recently
+                    if time - connection.last_active() > connection.timeout() {
+                        // remove it from the parent active pool
+                        connection.parent_active_pool.remove(&connection.send_to);
+                        
+                        // we have to remove it later because of deadlock i think
+                        to_remove.push(connection.key().clone());
+                        
+                        shutdown_count += 1;
+                    }
                 });
+                
+                for connection in to_remove {
+                    active.remove(&connection);
+                }
+                
 
                 debug!("FINISHED CLEANUP; SHUTDOWN CONNECTIONS: {}", shutdown_count);
             }

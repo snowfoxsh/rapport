@@ -47,9 +47,10 @@ struct Connection {
 
     recv_handle: Option<Arc<JoinHandle<io::Result<()>>>>,
 
-    last_used: u32,
-
+    last_used: Arc<AtomicU32>,
     connection_pool: Arc<ConnectionPool>,
+    
+    parent_active_pool: Arc<DashMap<SocketAddr, Arc<Connection>>>
     // maybe store a ref to the buffer pool
 }
 
@@ -73,7 +74,7 @@ impl Hash for Connection {
 
 // maybe will need a list of valid return addresses
 impl Connection {
-    async fn new(origin_addr: SocketAddr, recv_socket: Arc<UdpSocket>, send_to: SocketAddr) -> io::Result<Connection> {
+    async fn new(origin_addr: SocketAddr, recv_socket: Arc<UdpSocket>, send_to: SocketAddr, parent_active_pool: Arc<DashMap<SocketAddr, Arc<Connection>>>) -> io::Result<Connection> {
         // get the address of the local socket
         // tiny bit of unnecessary overhead here
         let recv_in = recv_socket.local_addr()?;
@@ -85,8 +86,8 @@ impl Connection {
 
         let send_socket = Arc::new(send_socket);
         let connection_pool = get_connection_pool();
-        let last_used = connection_pool.time();
-        
+        let last_used = Arc::new(AtomicU32::new(connection_pool.time()));
+
         let mut connection = Connection {
             send_socket,
             send_to,
@@ -96,9 +97,11 @@ impl Connection {
 
             origin_addr,
             recv_handle: None,
-            
+
             last_used,
             connection_pool,
+            
+            parent_active_pool
         };
         
         debug!("INIT; SEND CONNECTION: {:?} -> {:?}", connection.send_to, connection.recv_in);
@@ -131,6 +134,9 @@ impl Connection {
                     debug!("DROP; FROM {:?}", connection.send_to);
                     continue;
                 }
+                connection.last_used.store(connection.connection_pool.time(), Ordering::Relaxed);
+                debug!("LAST USED; {} | {}", connection.last_used.load(Ordering::Relaxed), connection.connection_pool.time());
+                 
                 debug!("RECV; LOCATION {:?}", connection.send_to);
                 
                 let bytes = &buf[..length];
@@ -153,13 +159,13 @@ impl Connection {
     fn terminate(self) {
         self.recv_handle.unwrap().abort()
     }
-    
+
     pub(crate) fn timeout(&self) -> u32 {
-        30
+        4
     }
-    
+
     pub(crate) fn last_active(&self) -> u32 {
-        self.last_used
+        self.last_used.load(Ordering::Relaxed)
     }
 }
 
@@ -211,9 +217,9 @@ impl Stream {
         let connection: Arc<Connection> = if let Some(active) = self.active.get(&send_to) {
             active.value().clone()
         } else {
-            let connection = Connection::new(sent_from, Arc::clone(&self.socket), *send_to).await?;
+            let connection = Connection::new(sent_from, Arc::clone(&self.socket), *send_to, self.active.clone()).await?;
             let connection: Arc<Connection> = Arc::new(connection);
-            
+
             let connection_pool = get_connection_pool();
             connection_pool.add_connection(connection.clone());
 
