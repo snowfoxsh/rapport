@@ -2,9 +2,9 @@ use rlimit::{increase_nofile_limit, setrlimit, Resource};
 
 mod args;
 mod configure;
+mod pool;
 mod port_range;
 mod router;
-mod pool;
 mod timer;
 
 use crate::args::Cli;
@@ -25,15 +25,15 @@ use tokio::net::{ToSocketAddrs, UdpSocket};
 use tokio::sync::{Mutex, Semaphore};
 use tokio::{io, task, time};
 
-use dashmap::mapref::one::Ref;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use std::time::Duration;
-use libc::time;
-use tokio::task::JoinHandle;
-use tokio::time::{Instant, Interval};
-use pool::{ConnectionPool};
 use crate::pool::get_connection_pool;
 use crate::router::Router;
+use dashmap::mapref::one::Ref;
+use libc::time;
+use pool::ConnectionPool;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::time::Duration;
+use tokio::task::JoinHandle;
+use tokio::time::{Instant, Interval};
 
 #[derive(Clone)]
 struct Connection {
@@ -49,16 +49,15 @@ struct Connection {
 
     last_used: Arc<AtomicU32>,
     connection_pool: Arc<ConnectionPool>,
-    
-    parent_active_pool: Arc<DashMap<SocketAddr, Arc<Connection>>>
-    // maybe store a ref to the buffer pool
+
+    parent_active_pool: Arc<DashMap<SocketAddr, Arc<Connection>>>, // maybe store a ref to the buffer pool
 }
 
 impl PartialEq for Connection {
     fn eq(&self, other: &Self) -> bool {
-        self.send_to == other.send_to &&
-        self.recv_in == other.recv_in &&
-        self.origin_addr == other.origin_addr
+        self.send_to == other.send_to
+            && self.recv_in == other.recv_in
+            && self.origin_addr == other.origin_addr
     }
 }
 
@@ -74,7 +73,12 @@ impl Hash for Connection {
 
 // maybe will need a list of valid return addresses
 impl Connection {
-    async fn new(origin_addr: SocketAddr, recv_socket: Arc<UdpSocket>, send_to: SocketAddr, parent_active_pool: Arc<DashMap<SocketAddr, Arc<Connection>>>) -> io::Result<Connection> {
+    async fn new(
+        origin_addr: SocketAddr,
+        recv_socket: Arc<UdpSocket>,
+        send_to: SocketAddr,
+        parent_active_pool: Arc<DashMap<SocketAddr, Arc<Connection>>>,
+    ) -> io::Result<Connection> {
         // get the address of the local socket
         // tiny bit of unnecessary overhead here
         let recv_in = recv_socket.local_addr()?;
@@ -100,54 +104,69 @@ impl Connection {
 
             last_used,
             connection_pool,
-            
-            parent_active_pool
+
+            parent_active_pool,
         };
-        
-        debug!("INIT; SEND CONNECTION: {:?} -> {:?}", connection.send_to, connection.recv_in);
+
+        debug!(
+            "INIT; SEND CONNECTION: {:?} -> {:?}",
+            connection.send_to, connection.recv_in
+        );
         // todo: add this handle to the error watcher to await
         // begin receiving
         connection.recv_handle = Some(Arc::new(connection.recv()));
-        
+
         Ok(connection)
     }
-   
+
     fn recv(&self) -> JoinHandle<io::Result<()>> {
         let connection = self.clone();
-        
+
         task::spawn(async move {
-            debug!("INIT; CONNECTION: {:?} -> {:?}", connection.send_to, connection.origin_addr);
+            debug!(
+                "INIT; CONNECTION: {:?} -> {:?}",
+                connection.send_to, connection.origin_addr
+            );
             // todo: buf pool
             let mut buf = BytesMut::with_capacity(SOCK_BUFFER_SIZE);
-            
+
             loop {
                 connection.send_socket.readable().await?;
-                
+
                 let (length, from) = match connection.send_socket.try_recv_buf_from(&mut buf) {
                     Ok((length, from)) => (length, from),
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
                     Err(e) => return Err(e),
                 };
-                
+
                 // drop the packet if it is not from the client
                 if from != connection.send_to {
                     debug!("DROP; FROM {:?}", connection.send_to);
                     continue;
                 }
-                connection.last_used.store(connection.connection_pool.time(), Ordering::Relaxed);
-                debug!("LAST USED; {} | {}", connection.last_used.load(Ordering::Relaxed), connection.connection_pool.time());
-                 
+                connection
+                    .last_used
+                    .store(connection.connection_pool.time(), Ordering::Relaxed);
+                debug!(
+                    "LAST USED; {} | {}",
+                    connection.last_used.load(Ordering::Relaxed),
+                    connection.connection_pool.time()
+                );
+
                 debug!("RECV; LOCATION {:?}", connection.send_to);
-                
+
                 let bytes = &buf[..length];
-                let sent_size = connection.recv_socket.send_to(bytes, connection.origin_addr).await?;
+                let sent_size = connection
+                    .recv_socket
+                    .send_to(bytes, connection.origin_addr)
+                    .await?;
                 debug!("SENT; LOCATION: {:?}, LEN: {sent_size}", connection.recv_in);
-                
+
                 buf.resize(SOCK_BUFFER_SIZE, 0x0);
             }
         })
     }
-    
+
     pub fn recv_handle(&self) -> Arc<JoinHandle<io::Result<()>>> {
         self.recv_handle.clone().unwrap()
     }
@@ -155,7 +174,6 @@ impl Connection {
     async fn send(&self, bytes: &[u8]) -> io::Result<usize> {
         self.send_socket.send_to(bytes, self.send_to).await
     }
-
 
     pub(crate) fn timeout(&self) -> u32 {
         4
@@ -190,9 +208,9 @@ impl Stream {
     pub async fn bind(router: StreamRouter) -> io::Result<Stream> {
         let socket = UdpSocket::bind(router.recv).await?;
         let socket = Arc::new(socket);
-        
+
         let active = Arc::new(DashMap::new());
-        
+
         get_connection_pool().add(active.clone()).await;
 
         Ok(Self {
@@ -202,13 +220,9 @@ impl Stream {
         })
     }
 
-
-
     pub fn socket(&self) -> &UdpSocket {
         self.socket.as_ref()
     }
-
-
 
     pub async fn send(&self, sent_from: SocketAddr, bytes: &[u8]) -> io::Result<()> {
         // lookup the correct route
@@ -230,7 +244,13 @@ impl Stream {
         let connection: Arc<Connection> = if let Some(active) = self.active.get(&send_to) {
             active.value().clone()
         } else {
-            let connection = Connection::new(sent_from, Arc::clone(&self.socket), *send_to, self.active.clone()).await?;
+            let connection = Connection::new(
+                sent_from,
+                Arc::clone(&self.socket),
+                *send_to,
+                self.active.clone(),
+            )
+            .await?;
             let connection: Arc<Connection> = Arc::new(connection);
 
             // let connection_pool = get_connection_pool();
@@ -248,8 +268,7 @@ impl Stream {
     }
 
     fn listen(self) -> JoinHandle<io::Result<()>> {
-        
-        task::spawn( async move {
+        task::spawn(async move {
             debug!("LISTEN; {}", self.router.recv);
             let mut buf = BytesMut::with_capacity(SOCK_BUFFER_SIZE);
 
@@ -283,7 +302,7 @@ impl StreamRouter {
             routes: DashMap::new(),
         }
     }
-    
+
     pub fn add_route(&mut self, from_addr: SocketAddr, to_addr: SocketAddr) {
         // create the route
         self.routes.insert(from_addr, to_addr);
@@ -312,8 +331,10 @@ async fn main() -> std::io::Result<()> {
 
     // let connection_pool = Arc::new(ConnectionPool::new());
 
-    let router = StreamRouter::recv("127.0.0.1:5000".parse().unwrap())
-        .route("127.0.0.1:7000".parse().unwrap(), "127.0.0.1:6000".parse().unwrap());
+    let router = StreamRouter::recv("127.0.0.1:5000".parse().unwrap()).route(
+        "127.0.0.1:7000".parse().unwrap(),
+        "127.0.0.1:6000".parse().unwrap(),
+    );
 
     let stream = Stream::bind(router).await?;
 

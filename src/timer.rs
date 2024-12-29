@@ -1,14 +1,14 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use tokio::time;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::Instant;
 use tokio::task::JoinHandle;
+use tokio::time;
+use tokio::time::Instant;
 
 pub struct Timer {
     start: Instant,
     elapsed: Arc<AtomicU32>,
-    timer_handle: Option<JoinHandle<()>>
+    timer_handle: Option<JoinHandle<()>>,
 }
 
 impl Timer {
