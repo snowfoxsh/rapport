@@ -1,5 +1,5 @@
+use crate::connection::Connection;
 use crate::timer::Timer;
-use crate::Connection;
 use dashmap::DashMap;
 use log::debug;
 use std::net::SocketAddr;
