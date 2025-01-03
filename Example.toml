@@ -1,0 +1,43 @@
+# some config for UDP specificly
+
+[udp]
+
+[[routes]]
+bind_socket = "0.0.0.0:3000"
+from_socket = "127.0.0.1:3001"
+to_addr = "32.33.44.44"
+
+[[routes]]
+bind_socket = "0.0.0.0:4000"
+from_socket = "127.0.0.1:4001"
+to_addr = "32.33.44.45"
+
+
+# First listening socket
+[[listen]]
+bind_socket = "0.0.0.0:3000"
+
+[[listen.route]]
+from = "127.0.0.1:1222"
+to = "5.4.3.2:4000"
+
+[[listen.route]]
+from = "127.0.0.1:1333"
+to = "5.4.3.3:4001"
+
+# Second listening socket
+[[listen]]
+bind_socket = "0.0.0.0:4000"
+
+[[listen.route]]
+from = "192.168.0.100:1444"
+to = "6.7.8.9:5000"
+
+[[listen.route]]
+from = "192.168.0.100:1555"
+to = "6.7.8.10:5001"
+[[listen]]
+bind_socket = "0.0.0.0:3000"
+
+
+
