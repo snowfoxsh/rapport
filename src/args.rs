@@ -13,7 +13,7 @@ pub struct Cli {
         short,
         long,
         value_name = "FILE",
-        default_value = "/etc/massudpproxy.toml"
+        default_value = "/etc/Rapport.toml"
     )]
     pub config_file: String,
 
