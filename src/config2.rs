@@ -84,9 +84,40 @@ nest! {
 lazy start the buffer pool
 if you specify the buffer pool size, then it should start the buffer pool maybe?
 
-add log level support. eventually clean up the logs to be as useful as possible
+add log level support. eventually clean up the logs to be as useful as possible.
 
 integrate metrics. they should be behind a feature flag. eventually, a web dashboard would be very cool for metrics.
 
 config should be "last definition wins"
- */
+
+when configuring with command line arguments, it makes sense to just specify routes one by one.
+if a user needs something more complex than that, they should just make a config file.
+
+command line arguments will override the config values, including routes.
+
+config will need to map into single routes and config objects for the sockets
+
+## dns
+i think it is okay to just resolve dns whenever. this will respect time to live.
+if the dns resolves to a non-address im not sure if it should error or warn or panic.
+i think error might be the best but panic would be the most aggressive ofc.
+
+i think that using a global dns object in a OnceLock to lazily create the dns would be the best option.
+some servers will likely not use domains and they should not be subject to the performance cost of using it.
+
+i will create these types
+HostAddr (www.winux.com) -[resolve().await]-> IpAddr
+IpAddr:Port -> IpAddr:Port
+SocketAddr -> SocketAddr
+HostSocket (www.winux.com:0001) -[resolve().await]-> SocketAddr
+
+for the pool, when you run out of buffers, then add the created buffer to the pool.
+every few seconds sweep through the pool to flush the excess buffers.
+this would be a very "intelligent"
+log (info): high watermark was 100 buffers
+high watermark = how big is the pool when i do the sweep
+
+change: should have a buffer pool by default
+
+add minimum and maximum buffer amount
+*/

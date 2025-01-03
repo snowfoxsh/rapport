@@ -2,42 +2,49 @@
 
 [udp]
 
-[[routes]]
-bind_socket = "0.0.0.0:3000"
-from_socket = "127.0.0.1:3001"
-to_addr = "32.33.44.44"
+# more generatable
+#[[route]]
+#bind_socket = "0.0.0.0:3000"
+#from_socket = "127.0.0.1:3001"
+#to_socket = "32.33.44.44:3333"
 
-[[routes]]
-bind_socket = "0.0.0.0:4000"
-from_socket = "127.0.0.1:4001"
-to_addr = "32.33.44.45"
+[[route]]
+bind_socket = "0.0.0.0:4000" # maybe just bind
+to_socket = "32.33.44.45:3333"
 
 
+# human-readable
 # First listening socket
-[[listen]]
+[[service]]
 bind_socket = "0.0.0.0:3000"
 
-[[listen.route]]
+[[service.route]]
+from = "all" # "0.0.0.0:0"
+to = "4.2.2.4:3000"
+
+[[service.route]]
 from = "127.0.0.1:1222"
 to = "5.4.3.2:4000"
 
-[[listen.route]]
+[[service.route]]
 from = "127.0.0.1:1333"
 to = "5.4.3.3:4001"
 
 # Second listening socket
-[[listen]]
+[[service]]
 bind_socket = "0.0.0.0:4000"
 
-[[listen.route]]
+[[service.route]]
 from = "192.168.0.100:1444"
 to = "6.7.8.9:5000"
 
-[[listen.route]]
+[[service.route]]
 from = "192.168.0.100:1555"
 to = "6.7.8.10:5001"
-[[listen]]
-bind_socket = "0.0.0.0:3000"
 
 
+#[[service]]
+#bind_socket = "0.0.0.0:3000"
 
+# larry:
+# rapport -u 1.2.3.4:5000,5.6.7.8:7777
