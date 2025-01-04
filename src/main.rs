@@ -62,40 +62,17 @@ impl Stream {
         // send from connection socket
 
         // lookup the correct route
-        // let Some(send_to) = self.router.routes.get(&sent_from) else {
-        //     drop the packet
-            // debug!("DROP; FROM {:?}", sent_from);
-            // return Ok(());
-        // };
-
-        // Ref<'_, K, V> has to be deref at the last possible second
-        // let Some(send_to) = self.router.solve_route(&sent_from) else { 
-        //     debug!("DROP; FROM {:?}", sent_from);
-        //     return Ok(())
-        // };
-
-        let Some(send_to) = self.router.solve_route2(&sent_from) else {
+        let Some(send_to) = self.router.solve_route(&sent_from) else {
             debug!("DROP; FROM {:?}", sent_from);
             return Ok(())
         };
-        
-        // let s = send_to;
-        // todo: make sure router supports default values
-
-        // let default = | send_to : Result<Ref<SocketAddr, SocketAddr>, _>| {
-        //     send_to.map_or_else(|err| err, |ok| ok.value())
-        // };
 
         // get a handle on the connection
         let connection: Arc<Connection> = if let Some(active) = self.active.get(send_to.socket()) {
             active.value().clone()
         } else {
-
             let connection = Connection::new(sent_from, Arc::clone(&self.socket), *send_to.socket()).await?;
             let connection: Arc<Connection> = Arc::new(connection);
-
-            // let connection_pool = get_connection_pool();
-            // connection_pool.add_connection(connection.clone());
 
             self.active.insert(*send_to.socket(), connection.clone());
             connection
@@ -171,36 +148,13 @@ impl StreamRouter {
         self
     }
 
-    pub fn solve_route(&self, addr: &SocketAddr) -> Option<Result<Ref<'_, SocketAddr, SocketAddr>, &SocketAddr>> {
-        if let Some(route) =  self.routes.get(addr) {
-            Some(Ok(route))
-        } else {
-            self.default.as_ref().map(|x| Err(x))
-        }
-    }
-    
-    pub fn solve_route2(&self, addr: &SocketAddr) -> Option<SolvedSocket> {
+    pub fn solve_route(&self, addr: &SocketAddr) -> Option<SolvedSocket> {
         if let Some(route) =  self.routes.get(addr) {
             Some(SolvedSocket::DashRef(route))
         } else {
             self.default.as_ref().map(|x: &SocketAddr| SolvedSocket::Ref(x))
         }
     }
-    // pub fn solve_route2<'a, 'b>(&'a self, addr: &'b SocketAddr) -> impl Fn() -> Option<&'a SocketAddr> + use<'a, 'b> {
-    //     // self.routes.get(addr).map(|ref_entry| ref_entry.value())
-    // 
-    //     || {
-    //         if let Some(route) =  self.routes.get(addr) {
-    //             Some(Ok(route))
-    //         } else {
-    //             self.default.as_ref().map(|x| Err(x))
-    //         }.map(|x| x.map_or_else(|err| err, |ok| ok.value()))
-    //     }
-    // }
-    // pub fn solve_route3<'a>(&'a self, addr: &'a SocketAddr) -> impl Fn() -> Option<&'a SocketAddr> + 'a {
-    //     // Capture `self` and `addr` by reference
-    //     move || self.routes.get(addr).map(|entry| entry.value())
-    // }
 }
 
 // this type exists to get value at the last possible moment
