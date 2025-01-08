@@ -75,6 +75,13 @@ nest! {
                     },
                 }
             }>,
+            service: Vec<pub struct UdpService {
+                #[serde(flatten)]
+                socket_options: UdpSocketOptions,
+                route: Vec<pub struct UdpServiceRoute {
+                    
+                }>
+            }>,
         }
     }
 }

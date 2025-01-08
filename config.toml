@@ -2,9 +2,9 @@
 # rememebr to run in release mode `cargo run --release -- -c my_other_config.toml`
 # enable debugging (no release) `RUST_LOG=debug cargo run`
 # to build using cargo run `cargo build --release`
-# the bin will be target/release/massudpproxy
+# the bin will be target/release/rapport
 
-# the default location of this file is /etc/massudpproxy.toml
+# the default location of this file is /etc/rapport.toml
 # ranges are inclusive
 
 #buffer_pool_permits = 10_000 # 10,000 is the default,
@@ -54,22 +54,42 @@
 ##local_ports = [5000, 5001]
 ##remote_ports = [6000, 6001]
 
-# Configuration for massudpproxy server
-buffer_pool_permits = 20_000 # Increased for higher testing load
-
-# Routes for testing
-# Local and remote port ranges for the Python script
-[[routes]]
-local_addr = "127.0.0.2"
-remote_addr = "127.0.0.1"
-local_port_range = [5000, 5009]
-remote_port_range = [6000, 6009]
-
-[[routes]]
-local_addr = "127.0.0.1"
-remote_addr = "127.0.0.1"
-local_port_range = [5000, 5009]
-remote_port_range = [6000, 6009]
+## Configuration for rapport server
+#buffer_pool_permits = 20_000 # Increased for higher testing load
+#
+## Routes for testing
+## Local and remote port ranges for the Python script
+#[[routes]]
+#local_addr = "127.0.0.2"
+#remote_addr = "127.0.0.1"
+#local_port_range = [5000, 5009]
+#remote_port_range = [6000, 6009]
+#
+#[[routes]]
+#local_addr = "127.0.0.1"
+#remote_addr = "127.0.0.1"
+#local_port_range = [5000, 5009]
+#remote_port_range = [6000, 6009]
 
 # a -> z , z -> a
 # every map is two queues two sockets
+#
+#
+#resolve = { ipv4 = [], }
+#
+#thread_count = 10
+#
+#[udp]
+#os_socket_buffer_size = 2048
+#
+#[[route]]
+#local = "127.0.0.1:3000"
+#remote = "127.0.0.1:3333"
+#
+#[[route]]
+#timeout = 30
+#local = "127.0.0.1:3000"
+#remote = "127.0.0.1:3333"
+#
+#
+#[tcp]

@@ -6,6 +6,7 @@ mod port_range;
 mod router;
 mod timer;
 mod config2;
+mod dns;
 
 use std::marker::PhantomData;
 use bytes::BytesMut;
@@ -111,9 +112,6 @@ impl Stream {
     }
 }
 
-
-
-
 struct StreamRouter {
     recv: SocketAddr,
     routes: DashMap<SocketAddr, SocketAddr>,
@@ -170,6 +168,16 @@ impl<'a> SolvedSocket<'a> {
             SolvedSocket::Ref(r) => {r}
         }
     }
+}
+
+struct StreamOptions {
+    socket_os_buffer_size: Option<usize>,
+    socket_buffer_size: usize,
+    allocate_from_pool: bool,
+}
+
+struct ConnectionOptions {
+    
 }
 pub const SOCK_BUFFER_SIZE: usize = 4096;
 
