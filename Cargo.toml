@@ -3,6 +3,9 @@ name = "rapport"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+dns = []
+
 [dependencies]
 # network
 tokio = { version = "1.42.0", features = ["net", "macros", "rt-multi-thread", "fs", "io-util"] }

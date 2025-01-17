@@ -8,6 +8,7 @@ mod timer;
 mod config2;
 mod dns;
 
+use std::fmt::Display;
 use std::marker::PhantomData;
 use bytes::BytesMut;
 use dashmap::DashMap;
@@ -25,11 +26,17 @@ use futures::task::waker;
 use hickory_resolver::AsyncResolver;
 use hickory_resolver::config::{ResolverConfig, ResolverOpts};
 use tokio::task::JoinHandle;
+use crate::dns::{init_resolver, HostSocket};
 
 struct Stream {
-    // Arc<T> because we need to share to timeout thread
+    /// shared reference to active connections
+    /// Arc<T> because we need to share to timeout thread
     active: Arc<DashMap<SocketAddr, Arc<Connection>>>, // active connections to the socket
+    
+    /// static routing table
     router: StreamRouter, // C:x -> S:y
+    
+    /// Packets are sent to this socket, they are then routed to the appropriate socket based on the routing table
     socket: Arc<UdpSocket>,
 }
 
@@ -38,9 +45,9 @@ impl Stream {
         let socket = UdpSocket::bind(router.recv).await?;
         let socket = Arc::new(socket);
 
-        let active = Arc::new(DashMap::new());
+        let active: Arc<DashMap<SocketAddr, _>> = Arc::new(DashMap::new());
 
-        get_connection_pool().add(active.clone()).await;
+        get_connection_pool().add(Arc::clone(&active)).await;
 
         Ok(Self {
             socket,
@@ -67,15 +74,19 @@ impl Stream {
             debug!("DROP; FROM {:?}", sent_from);
             return Ok(())
         };
-
+        
+        let resolved_addr = send_to.socket().resolve().await.unwrap();
+        
         // get a handle on the connection
-        let connection: Arc<Connection> = if let Some(active) = self.active.get(send_to.socket()) {
-            active.value().clone()
+        let connection: Arc<Connection> = if let Some(active) = self.active.get(&resolved_addr) {
+            // the connection exists
+            Arc::clone(&active.value())
         } else {
-            let connection = Connection::new(sent_from, Arc::clone(&self.socket), *send_to.socket()).await?;
+            // a new connection must be made
+            let connection = Connection::new(sent_from, Arc::clone(&self.socket), resolved_addr.clone()).await?; // why can i not * any more?
             let connection: Arc<Connection> = Arc::new(connection);
 
-            self.active.insert(*send_to.socket(), connection.clone());
+            self.active.insert(resolved_addr.clone(), connection.clone());
             connection
         };
 
@@ -114,8 +125,8 @@ impl Stream {
 
 struct StreamRouter {
     recv: SocketAddr,
-    routes: DashMap<SocketAddr, SocketAddr>,
-    default: Option<SocketAddr>,
+    routes: DashMap<SocketAddr, HostSocket>,
+    default: Option<HostSocket>,
 }
 
 impl StreamRouter {
@@ -127,45 +138,48 @@ impl StreamRouter {
         }
     }
 
-    pub fn add_route(&mut self, from_addr: SocketAddr, to_addr: SocketAddr) {
+    pub fn add_route(&mut self, from_addr: SocketAddr, to_addr: HostSocket) {
         // create the route
         self.routes.insert(from_addr, to_addr);
     }
 
-    pub fn route(mut self, from_addr: SocketAddr, to_addr: SocketAddr) -> Self {
+    pub fn route(mut self, from_addr: SocketAddr, to_addr: HostSocket) -> Self {
         self.add_route(from_addr, to_addr);
         self
     }
 
-    pub fn add_default(&mut self, to_addr: SocketAddr) {
+    pub fn add_default(&mut self, to_addr: HostSocket) {
         self.default = Some(to_addr)
     }
 
-    pub fn default(mut self, to_addr: SocketAddr) -> Self{
+    pub fn default(mut self, to_addr: HostSocket) -> Self{
         self.add_default(to_addr);
         self
     }
 
-    pub fn solve_route(&self, addr: &SocketAddr) -> Option<SolvedSocket> {
+    pub fn solve_route(&self, addr: &SocketAddr) -> Option<SocketOrDefault> {
+        // dns lookup should happen in the router
+        
+        // todo: feature reverse lookup maybe
         if let Some(route) =  self.routes.get(addr) {
-            Some(SolvedSocket::DashRef(route))
+            Some(SocketOrDefault::DashRef(route))
         } else {
-            self.default.as_ref().map(|x: &SocketAddr| SolvedSocket::Ref(x))
+            self.default.as_ref().map(|x: &HostSocket| SocketOrDefault::Ref(x))
         }
     }
 }
 
 // this type exists to get value at the last possible moment
-enum SolvedSocket<'a> {
-    DashRef(Ref<'a, SocketAddr, SocketAddr>),
-    Ref(&'a SocketAddr)
+enum SocketOrDefault<'a> {
+    DashRef(Ref<'a, SocketAddr, HostSocket>),
+    Ref(&'a HostSocket)
 }
 
-impl<'a> SolvedSocket<'a> {
-    fn socket(&'a self) -> &'a SocketAddr {
+impl<'a> SocketOrDefault<'a> {
+    fn socket(&'a self) -> &'a HostSocket {
         match self {
-            SolvedSocket::DashRef(r) => {r.value()}
-            SolvedSocket::Ref(r) => {r}
+            SocketOrDefault::DashRef(r) => {r.value()}
+            SocketOrDefault::Ref(r) => {r}
         }
     }
 }
@@ -189,11 +203,13 @@ async fn main() -> io::Result<()> {
         .init();
 
     info!("SERVER STARTING");
+    
+    init_resolver(None);
 
     let router = StreamRouter::recv("127.0.0.1:5000".parse().unwrap()).route(
         "127.0.0.1:7000".parse().unwrap(),
-        "127.0.0.1:6000".parse().unwrap(),
-    );
+        "www.winux.com:3000".parse().unwrap(),
+    ).route("127.0.0.1:4000".parse().unwrap(), "www.winux.com:3000".parse().unwrap());
 
     let stream = Stream::bind(router).await?;
 
@@ -238,6 +254,20 @@ async fn test_dns() {
     // println!("t1: {resolve1:?}, t2: {resolve2:?}");
 }
 
-fn a(addr: impl ToSocketAddrs) {
-    addr.to_socket_addrs();
-}
+
+// #[tokio::test]
+// async fn test_reverse() {
+//     let resolver = AsyncResolver::tokio_from_system_conf().unwrap();
+//     AsyncResolver::tokio(ResolverConfig::new(), ResolverOpts::default());
+// 
+//     let time1  = Instant::now();
+//     let s = "3.80.25.196".parse::<IpAddr>().unwrap().reverse_lookup(&resolver).await.unwrap();
+//     let time1 = time1.elapsed();
+// 
+//     let time2 = Instant::now();
+//     let s = "3.80.25.196".parse::<IpAddr>().unwrap().reverse_lookup(&resolver).await.unwrap();
+//     let time2 = time2.elapsed();
+//     
+//     println!("{:?}", time1);
+//     println!("{:?}", time2);
+// }

@@ -1,7 +1,7 @@
 use crate::pool::{get_connection_pool, ConnectionPool};
 use crate::SOCK_BUFFER_SIZE;
 use bytes::BytesMut;
-use log::debug;
+use log::{debug, error};
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::net::SocketAddr;
@@ -9,13 +9,14 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
+use crate::dns::{get_resolver, HostSocket};
 
 #[derive(Clone)]
 pub struct Connection {
     send_socket: Arc<UdpSocket>,
     send_to: SocketAddr,
 
-    recv_socket: Arc<UdpSocket>, // mark unused
+    recv_socket: Arc<UdpSocket>,
     recv_in: SocketAddr,
 
     origin_addr: SocketAddr,
@@ -63,6 +64,10 @@ impl Connection {
         let send_socket = Arc::new(send_socket);
         let connection_pool = get_connection_pool();
         let last_used = Arc::new(AtomicU32::new(connection_pool.time()));
+        
+        // when we create the connection resolve the ip that the connection sends to
+        // let send_to = send_to.resolve_socket(&get_resolver()).await
+        //     .expect("TODO: if the domain name is invalid this wont work");
 
         let mut connection = Connection {
             send_socket,
@@ -97,6 +102,7 @@ impl Connection {
                 "INIT; CONNECTION: {:?} -> {:?}",
                 connection.send_to, connection.origin_addr
             );
+            
             // todo: buf pool
             let mut buf = BytesMut::with_capacity(SOCK_BUFFER_SIZE);
 
@@ -108,7 +114,7 @@ impl Connection {
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
                     Err(e) => return Err(e),
                 };
-
+                
                 // drop the packet if it is not from the client
                 if from != connection.send_to {
                     debug!("DROP; FROM {:?}", connection.send_to);
@@ -124,7 +130,6 @@ impl Connection {
                 );
 
                 debug!("RECV; LOCATION {:?}", connection.send_to);
-
                 let bytes = &buf[..length];
                 let sent_size = connection
                     .recv_socket

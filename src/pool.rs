@@ -7,6 +7,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time;
+use crate::dns::HostSocket;
 
 static CONNECTION_POOL: OnceLock<Arc<ConnectionPool>> = OnceLock::new();
 

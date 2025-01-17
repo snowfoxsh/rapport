@@ -3,7 +3,7 @@ use hickory_resolver::TokioAsyncResolver;
 use serde_derive::Deserialize;
 use std::borrow::Cow;
 use addr::error::Kind;
-use std::net::{AddrParseError, IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{AddrParseError, IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
 use addr::domain::Name;
@@ -13,12 +13,11 @@ use thiserror::Error;
 use hickory_resolver::config::{ResolverConfig, ResolverOpts};
 use hickory_resolver::{AsyncResolver};
 use hickory_resolver::error::{ResolveError, ResolveResult};
-use hickory_resolver::proto::xfer::FirstAnswer;
-use crate::dns::LookupError::NoIp;
+use socket2::Domain;
 
 static RESOLVER: OnceLock<Arc<TokioAsyncResolver>> = OnceLock::new();
 
-fn init_resolver(config: Option<(ResolverConfig, ResolverOpts)>) -> Arc<TokioAsyncResolver> {
+pub fn init_resolver(config: Option<(ResolverConfig, ResolverOpts)>) -> Arc<TokioAsyncResolver> {
     // you cannot call init twice
     assert!(RESOLVER.get().is_none(), "RESOLVER has already been initialized");
 
@@ -31,34 +30,34 @@ fn init_resolver(config: Option<(ResolverConfig, ResolverOpts)>) -> Arc<TokioAsy
     RESOLVER.get_or_init(init_with).clone()
 }
 
-fn get_resolver() -> Arc<TokioAsyncResolver> {
+pub fn get_resolver() -> Arc<TokioAsyncResolver> {
     RESOLVER.get_or_init(|| {
         panic!("RESOLVER not initialized, set the resolver with dns::resolve::init_resolver");
     }).clone()
 }
 
-
 #[derive(Error, Debug)]
 #[error("invalid address: {s}")]
-pub struct HostAddrParse {
+pub struct HostAddrParseError {
     s: String,
 }
-#[derive(Debug)]
+
+#[derive(Debug, Hash, PartialEq, Eq, Clone)]
 pub enum HostAddr {
-    Domain(String),
+    Domain(DomainName),
     Addr(IpAddr),
 }
 
 impl FromStr for HostAddr {
-    type Err = HostAddrParse;
+    type Err = HostAddrParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         if let Ok(ip) = s.parse::<IpAddr>() {
             Ok(Self::Addr(ip))
-        } else if let Ok(name) = parse_domain_name(s) {
-            Ok(Self::Domain(s.to_string()))
+        } else if let Ok(name) = s.parse::<DomainName>() {
+            Ok(Self::Domain(name))
         } else {
-            Err(HostAddrParse { s: s.to_string() })
+            Err(HostAddrParseError { s: s.to_string() })
         }
     }
 }
@@ -139,15 +138,15 @@ impl<'de> Deserialize<'de> for HostSocket {
 impl HostAddr {
     pub fn name(&self) -> Option<Name<'_>> {
         match self {
-            Self::Domain(s) => {
-                Some(parse_domain_name(s.as_str()).unwrap())
+            Self::Domain(domain) => {
+                Some(parse_domain_name(domain.name.as_str()).unwrap())
             }
             _ => None
         }
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Hash, Eq, PartialEq, Clone)]
 pub struct HostSocket {
     addr: HostAddr,
     port: u16
@@ -158,11 +157,12 @@ pub struct HostSocket {
 pub struct HostParseError {
     s: String
 }
-
-pub trait Resolve: Sized {
-    async fn resolve(&self, resolver: &TokioAsyncResolver) -> Result<IpAddr, LookupError>;
-}
-
+// 
+// pub trait Lookup {
+//     type Addrs;
+//     async fn resolve(&self, resolver: &TokioAsyncResolver) -> Result<Self::Addrs, LookupError>;
+// }
+// 
 #[derive(Error, Debug)]
 pub enum LookupError {
     #[error("failed to resolve host address")]
@@ -171,11 +171,12 @@ pub enum LookupError {
     NoIp
 }
 
-impl Resolve for HostAddr {
-    async fn resolve(&self, resolver: &TokioAsyncResolver) -> Result<IpAddr, LookupError> {
+impl HostAddr {
+    async fn resolve(&self) -> Result<IpAddr, LookupError> {
+        let resolver = get_resolver();
         match self {
             HostAddr::Domain(name) => {
-                resolver.lookup_ip(name).await.map(|ips|  {
+                resolver.lookup_ip(name.name.as_str()).await.map(|ips|  {
                     // prioritise ipv4
                     if let Some(ipv4) = ips.iter().find(|ip| ip.is_ipv4()) {
                         Ok(ipv4)
@@ -191,12 +192,76 @@ impl Resolve for HostAddr {
     }
 }
 
-impl Resolve for HostSocket {
-    async fn resolve(&self, resolver: &TokioAsyncResolver) -> Result<IpAddr, LookupError> {
-        self.addr.resolve(resolver).await
+// pub trait ReverseLookup {
+//     type Host;
+//     async fn reverse_lookup(&self, resolver: &TokioAsyncResolver) -> Result<Self::Host, LookupError>;
+// }
+
+// impl ReverseLookup for IpAddr {
+//     type Host = DomainName;
+// 
+//     /// will always return a [HostAddr::Domain] variant
+//     async fn reverse_lookup(&self, resolver: &TokioAsyncResolver) -> Result<Self::Host, LookupError> {
+//         let response = resolver.reverse_lookup(*self).await?;
+//         
+//         let Some(name) = response.into_iter().next() else {
+//             
+//             return Err(LookupError::NoIp)
+//         };
+//         
+//         // this should always be a valid host domain
+//         Ok(name.to_string().parse().unwrap())
+//     }
+// }
+
+impl HostSocket {
+    pub(crate) async fn resolve(&self) -> Result<SocketAddr, LookupError> {
+        let addr = self.addr.resolve().await?;
+        
+        Ok(SocketAddr::new(addr, self.port))
     }
 }
 
+
+// impl HostSocket {
+//     pub(crate) async fn resolve_socket(&self, resolver: &TokioAsyncResolver) -> Result<SocketAddr, LookupError> {
+//         let ip = self.resolve(resolver).await?;
+// 
+//         Ok(SocketAddr::new(ip, self.port))
+//     }
+// }
+// 
+// impl Lookup for HostSocket {
+//     type Addrs = IpAddr;
+// 
+//     async fn resolve(&self, resolver: &TokioAsyncResolver) -> Result<Self::Addrs, LookupError> {
+//         self.addr.resolve(resolver).await
+//     }
+// }
+// 
+#[derive(Clone, Hash, PartialEq, Eq, Debug)]
+struct DomainName {
+    name: String,
+}
+
+#[derive(Error, Debug)]
+#[error("failed to parse domain name {}", self.0)]
+struct DomainNameParseError(String);
+
+
+impl FromStr for DomainName {
+    type Err = DomainNameParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let name = parse_domain_name(s)
+            .map_err(|_| DomainNameParseError(s.to_string()))?;
+        
+        Ok(Self {name: name.to_string()})
+        
+    }
+}
+
+// todo consider making a DomainName type instead of just doing the raw variant
 
 #[cfg(test)]
 mod tests {
@@ -230,7 +295,7 @@ mod tests {
         let socket: HostSocket = input.parse().unwrap();
         assert_eq!(socket.port, 443);
         match socket.addr {
-            HostAddr::Domain(domain) => assert_eq!(domain, "example.com"),
+            HostAddr::Domain(domain) => assert_eq!(domain.name, "example.com"),
             _ => panic!("Expected domain name"),
         }
     }
@@ -262,34 +327,35 @@ mod tests {
     async fn test_resolve() {
         // Initialize the resolver with system configuration
 
-        let resolver = TokioAsyncResolver::tokio_from_system_conf().unwrap();
+        // let resolver = TokioAsyncResolver::tokio_from_system_conf().unwrap();
+        init_resolver(None);
 
         // Test resolving an IPv4 address
         let ipv4_addr = HostAddr::Addr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
-        let resolved_ipv4 = ipv4_addr.resolve(&resolver).await.unwrap();
+        let resolved_ipv4 = ipv4_addr.resolve().await.unwrap();
         assert_eq!(resolved_ipv4, IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
 
         // Test resolving an IPv6 address
         let ipv6_addr = HostAddr::Addr(IpAddr::V6(Ipv6Addr::LOCALHOST));
-        let resolved_ipv6 = ipv6_addr.resolve(&resolver).await.unwrap();
+        let resolved_ipv6 = ipv6_addr.resolve().await.unwrap();
         assert_eq!(resolved_ipv6, IpAddr::V6(Ipv6Addr::LOCALHOST));
 
         // Test resolving a valid domain name
-        let domain_name = HostAddr::Domain("example.com".to_string());
-        let resolved_domain = domain_name.resolve(&resolver).await.unwrap();
+        let domain_name = HostAddr::Domain("example.com".to_string().parse().unwrap());
+        let resolved_domain = domain_name.resolve().await.unwrap();
         println!("Resolved domain to IP: {:?}", resolved_domain);
 
         // Assert that the resolved IP is valid (may vary depending on DNS settings)
         assert!(resolved_domain.is_ipv4() || resolved_domain.is_ipv6());
 
         // Test resolving an invalid domain name
-        let invalid_domain = HostAddr::Domain("invalid.invalid".to_string());
-        let result = invalid_domain.resolve(&resolver).await;
+        let invalid_domain = HostAddr::Domain("invalid.invalid".to_string().parse().unwrap());
+        let result = invalid_domain.resolve().await;
         assert!(matches!(result, Err(LookupError::CantResolve(_))));
 
         // Test resolving a domain that does not resolve to an IP
-        let no_ip_domain = HostAddr::Domain("nonexistent.example.com".to_string());
-        let result = no_ip_domain.resolve(&resolver).await;
+        let no_ip_domain = HostAddr::Domain("nonexistent.example.com".to_string().parse().unwrap());
+        let result = no_ip_domain.resolve().await;
         assert!(matches!(result, Err(_)));
     }
 }
