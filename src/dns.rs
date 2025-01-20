@@ -14,25 +14,27 @@ use hickory_resolver::config::{ResolverConfig, ResolverOpts};
 use hickory_resolver::{AsyncResolver};
 use hickory_resolver::error::{ResolveError, ResolveResult};
 use socket2::Domain;
+use tracing::{debug, info};
 
 static RESOLVER: OnceLock<Arc<TokioAsyncResolver>> = OnceLock::new();
 
 pub fn init_resolver(config: Option<(ResolverConfig, ResolverOpts)>) -> Arc<TokioAsyncResolver> {
     // you cannot call init twice
     assert!(RESOLVER.get().is_none(), "RESOLVER has already been initialized");
-
+    
     let init_with= || if let Some((config, options)) = config {
         Arc::new(AsyncResolver::tokio(config, options))
     } else {
         Arc::new(AsyncResolver::tokio_from_system_conf().expect("failed to init dns resolver from system conf"))
     };
 
+    debug!("creating dns resolver");
     RESOLVER.get_or_init(init_with).clone()
 }
 
 pub fn get_resolver() -> Arc<TokioAsyncResolver> {
     RESOLVER.get_or_init(|| {
-        panic!("RESOLVER not initialized, set the resolver with dns::resolve::init_resolver");
+        panic!("RESOLVER not initialized, set the resolver with dns::init_resolver");
     }).clone()
 }
 

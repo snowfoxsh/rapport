@@ -1,10 +1,11 @@
 use crate::connection::Connection;
 use crate::timer::Timer;
 use dashmap::DashMap;
-use log::debug;
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+use bytes::BytesMut;
+use lendpool::LendPool;
 use tokio::sync::Mutex;
 use tokio::time;
 use crate::dns::HostSocket;
@@ -15,6 +16,7 @@ pub(crate) fn get_connection_pool() -> Arc<ConnectionPool> {
     CONNECTION_POOL.get_or_init(ConnectionPool::new).clone()
 }
 
+#[derive(Debug)]
 pub struct ConnectionPool {
     active: Mutex<Vec<Arc<DashMap<SocketAddr, Arc<Connection>>>>>,
     timer: Timer,
@@ -52,7 +54,7 @@ impl ConnectionPool {
                     })
                 });
 
-                debug!(
+                tracing::debug!(
                     "FINISHED CLEANUP; ACTIVE CONNECTIONS: {}",
                     active_connections
                 );
@@ -71,3 +73,43 @@ impl ConnectionPool {
         self.active.lock().await.push(sub_pool)
     }
 }
+
+static BUFFER_POOL: OnceLock<LendPool<BytesMut>> = OnceLock::new();
+
+
+struct BufferPoolConfig {
+    buffer_count: usize,
+    initial_buffer_size: usize,
+}
+
+impl Default for BufferPoolConfig {
+    fn default() -> Self {
+        Self {
+            buffer_count: 100,
+            initial_buffer_size: 1024
+        }
+    }
+}
+
+pub fn init_buffer_pool<'a>(config: BufferPoolConfig) -> &'a LendPool<BytesMut> {
+    assert!(BUFFER_POOL.get().is_none(), "BUFFER_POOL has already been initialized");
+    
+    let init_with = || {
+        let pool = LendPool::new();
+
+        for _ in 0..config.buffer_count {
+            pool.add(BytesMut::with_capacity(config.initial_buffer_size))
+        }
+        
+        pool
+    };
+
+    BUFFER_POOL.get_or_init(init_with)
+}
+
+pub fn get_buffer_pool<'a>() -> &'a LendPool<BytesMut> {
+    BUFFER_POOL.get_or_init(|| {
+        panic!("BUFFER_POOL not initialized, create it with pool::init_buffer_pool")
+    })
+}
+

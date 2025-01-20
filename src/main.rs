@@ -12,7 +12,7 @@ use std::fmt::Display;
 use std::marker::PhantomData;
 use bytes::BytesMut;
 use dashmap::DashMap;
-use log::{debug, info};
+// use log::{debug, info};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -25,7 +25,11 @@ use dashmap::mapref::one::Ref;
 use futures::task::waker;
 use hickory_resolver::AsyncResolver;
 use hickory_resolver::config::{ResolverConfig, ResolverOpts};
+use lendpool::LendPool;
 use tokio::task::JoinHandle;
+use tracing::{debug, error, info, span, trace, trace_span, warn, Level, Span};
+use tracing::field::debug;
+use tracing_subscriber::util::SubscriberInitExt;
 use crate::dns::{init_resolver, HostSocket};
 
 struct Stream {
@@ -37,11 +41,19 @@ struct Stream {
     router: StreamRouter, // C:x -> S:y
     
     /// Packets are sent to this socket, they are then routed to the appropriate socket based on the routing table
-    socket: Arc<UdpSocket>,
+    socket: Arc<UdpSocket>, // todo: make this not Arc<T>
+    
+    socket_addr: SocketAddr,
+    
+    /// Store the span for logging
+    _span: Span,
 }
 
 impl Stream {
     pub async fn bind(router: StreamRouter) -> io::Result<Stream> {
+        // create the stream span
+        let _span = span!(Level::DEBUG, "stream", listen_sock=%router.recv);
+        
         let socket = UdpSocket::bind(router.recv).await?;
         let socket = Arc::new(socket);
 
@@ -51,8 +63,11 @@ impl Stream {
 
         Ok(Self {
             socket,
+            socket_addr: router.recv,
             active,
             router,
+            
+            _span
         })
     }
 
@@ -61,64 +76,78 @@ impl Stream {
     }
 
     pub async fn send(&self, sent_from: SocketAddr, bytes: &[u8]) -> io::Result<()> {
-        // lookup the correct route
-        // if: no route
-        // then: drop the packet
-        // find connection
-        // if: no connection
-        // then: create connection
-        // send from connection socket
+        // let span = span!(Level::TRACE, "sending packet", sending_from=%sent_from,);
+        // let _enter = span.enter();
+        trace!(sending_from=%sent_from, "sending packet");
 
         // lookup the correct route
         let Some(send_to) = self.router.solve_route(&sent_from) else {
-            debug!("DROP; FROM {:?}", sent_from);
+            trace!(sent_from=%sent_from, "dropped packet");
             return Ok(())
         };
         
         let resolved_addr = send_to.socket().resolve().await.unwrap();
-        
+
         // get a handle on the connection
         let connection: Arc<Connection> = if let Some(active) = self.active.get(&resolved_addr) {
             // the connection exists
-            Arc::clone(&active.value())
+            Arc::clone(active.value())
         } else {
             // a new connection must be made
-            let connection = Connection::new(sent_from, Arc::clone(&self.socket), resolved_addr.clone()).await?; // why can i not * any more?
-            let connection: Arc<Connection> = Arc::new(connection);
+            let connection = Connection::new(sent_from, (Arc::clone(&self.socket), self.socket_addr), resolved_addr).await?;
 
-            self.active.insert(resolved_addr.clone(), connection.clone());
+            self.active.insert(resolved_addr, connection.clone());
+
+            trace!(
+                send_socket=%connection.send_socket_addr(),
+                recv_socket=%connection.recv_socket_addr(),
+                origin_socket=%connection.origin_socket_addr(),
+                "creating connection"
+            );
             connection
         };
 
         // send the bytes to the server
         let sent_size = connection.send(bytes).await?;
-        debug!(
-            "SENT; LOCATION: {:?}, LEN: {sent_size}",
-            connection.recv_in()
-        );
+
+        trace!(sent_size=sent_size, "sent packet");
 
         Ok(())
     }
 
     fn listen(self) -> JoinHandle<io::Result<()>> {
         task::spawn(async move {
-            debug!("LISTEN; {}", self.router.recv);
+            let _enter = self._span.enter();
+            
+            debug!(listen_sock = %self.router.recv, "listening for packets");
             let mut buf = BytesMut::with_capacity(SOCK_BUFFER_SIZE);
 
-            loop {
-                self.socket().readable().await?;
+            let listener = async {
+                loop {
+                    let span = span!(Level::TRACE, "handling packet");
+                    let _enter = span.enter();
 
-                // todo: cache buffer size to determine when to shrink
-                let (length, from) = match self.socket().try_recv_buf_from(&mut buf) {
-                    Ok((length, from)) => (length, from),
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-                    Err(e) => return Err(e),
-                };
+                    self.socket().readable().await?;
+                    // todo: maybe make a tracing_span!() here for per packet debugging
 
-                debug!("RECV; FROM {:?}, LEN: {length}", from);
+                    // todo: cache buffer size to determine when to shrink
+                    let (length, from) = match self.socket().try_recv_buf_from(&mut buf) {
+                        Ok((length, from)) => (length, from),
+                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                        Err(e) => {
+                            error!(error = ?e, "failed to receive packet, terminating stream");
+                            return Err(e)
+                        },
+                    };
+                    trace!(from=%from, size=length, "received packet");
 
-                self.send(from, &buf[..length]).await?;
-            }
+                    self.send(from, &buf[..length]).await?;
+                }    
+            }.await;
+
+            error!(error = ?listener, listen_sock = %self.router.recv, "listening stopped");
+
+            listener
         })
     }
 }
@@ -133,7 +162,7 @@ impl StreamRouter {
     fn recv(addr: SocketAddr) -> Self {
         Self {
             default: None,
-            recv: addr.into(),
+            recv: addr,
             routes: DashMap::new(),
         }
     }
@@ -184,28 +213,34 @@ impl<'a> SocketOrDefault<'a> {
     }
 }
 
-struct StreamOptions {
-    socket_os_buffer_size: Option<usize>,
-    socket_buffer_size: usize,
-    allocate_from_pool: bool,
-}
-
-struct ConnectionOptions {
-    
-}
+// struct StreamOptions {
+//     socket_os_buffer_size: Option<usize>,
+//     socket_buffer_size: usize,
+//     allocate_from_pool: bool,
+// }
+// 
+// struct ConnectionOptions {
+//     
+// }
 pub const SOCK_BUFFER_SIZE: usize = 4096;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
     // start logging
-    env_logger::Builder::new()
-        .filter_level(log::LevelFilter::Debug)
+    tracing_subscriber::fmt()
+        .with_max_level(Level::TRACE)
+        .with_target(true)
         .init();
-
-    info!("SERVER STARTING");
     
-    init_resolver(None);
+    // todo: add tokio thread count here
+    let server_span = span!(Level::INFO, "rapport", version=env!("CARGO_PKG_VERSION"));
+    let _enter = server_span.enter();
 
+    info!("starting server");
+    
+    // init the things
+    init_resolver(None);
+    
     let router = StreamRouter::recv("127.0.0.1:5000".parse().unwrap()).route(
         "127.0.0.1:7000".parse().unwrap(),
         "www.winux.com:3000".parse().unwrap(),
@@ -215,6 +250,7 @@ async fn main() -> io::Result<()> {
 
     stream.listen().await??;
 
+    info!("server shutdown");
     Ok(())
 }
 

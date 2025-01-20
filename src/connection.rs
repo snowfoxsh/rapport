@@ -1,7 +1,6 @@
-use crate::pool::{get_connection_pool, ConnectionPool};
+use crate::pool::{get_buffer_pool, get_connection_pool, ConnectionPool};
 use crate::SOCK_BUFFER_SIZE;
 use bytes::BytesMut;
-use log::{debug, error};
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::net::SocketAddr;
@@ -9,9 +8,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
+use tracing::{debug, trace, span, Level, Span, warn};
 use crate::dns::{get_resolver, HostSocket};
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Connection {
     send_socket: Arc<UdpSocket>,
     send_to: SocketAddr,
@@ -25,6 +25,16 @@ pub struct Connection {
 
     last_used: Arc<AtomicU32>,
     connection_pool: Arc<ConnectionPool>,
+    
+    _span: Span,
+}
+
+impl Connection {
+    pub fn send_socket_addr(&self) -> SocketAddr { self.send_to }
+    
+    pub fn recv_socket_addr(&self) -> SocketAddr { self.recv_in }
+    
+    pub fn origin_socket_addr(&self) -> SocketAddr { self.origin_addr }
 }
 
 impl PartialEq for Connection {
@@ -49,26 +59,26 @@ impl Hash for Connection {
 impl Connection {
     pub(crate) async fn new(
         origin_addr: SocketAddr,
-        recv_socket: Arc<UdpSocket>,
+        socket: (Arc<UdpSocket>, SocketAddr),
         send_to: SocketAddr,
-    ) -> io::Result<Connection> {
-        // get the address of the local socket
-        // tiny bit of unnecessary overhead here
-        let recv_in = recv_socket.local_addr()?;
+    ) -> io::Result<Arc<Connection>> {
+        let _span = span!(Level::INFO, "initiating connection");
+        let _enter_span = _span.clone();
+        let _enter = _enter_span.enter();
+        
+        let (recv_socket, recv_in) = socket;
 
         // todo: maybe specify a way in the config to send from particular socket
         // bind the output socket; we dont care where it comes from
         let send_socket = UdpSocket::bind("0.0.0.0:0").await?;
-        debug!("BOUND TO SOCKET {:?}", send_socket.local_addr()?);
-
+        
+        // todo: ask larry about this sys call
+        trace!(socket=%send_socket.local_addr()?, "connection sending data from socket");
+        
         let send_socket = Arc::new(send_socket);
         let connection_pool = get_connection_pool();
         let last_used = Arc::new(AtomicU32::new(connection_pool.time()));
         
-        // when we create the connection resolve the ip that the connection sends to
-        // let send_to = send_to.resolve_socket(&get_resolver()).await
-        //     .expect("TODO: if the domain name is invalid this wont work");
-
         let mut connection = Connection {
             send_socket,
             send_to,
@@ -81,23 +91,41 @@ impl Connection {
 
             last_used,
             connection_pool,
+            
+            _span
         };
-
-        debug!(
-            "INIT; SEND CONNECTION: {:?} -> {:?}",
-            connection.send_to, connection.recv_in
-        );
-        // todo: add this handle to the error watcher to await
+        
         // begin receiving
-        connection.recv_handle = Some(Arc::new(connection.recv()));
+        // connection.recv_handle = Some(Arc::new(connection.recv()));
+        let recv_handle = connection.recv();
+        
+        
+        if recv_handle.is_finished() {
+            warn!(
+                a=%connection.send_to,
+                b=%connection.recv_in,
+                "failed to spawn connection recv task",
+            );
+        } else {
+            debug!(
+                a=%connection.send_to,
+                b=%connection.recv_in,
+                "successfully started connection recv task",
+            );
+        }
 
-        Ok(connection)
+        connection.recv_handle = Some(Arc::new(recv_handle));
+        
+        // todo: add this connection to the error watcher to await the future
+        
+        Ok(Arc::new(connection))
     }
 
     fn recv(&self) -> JoinHandle<io::Result<()>> {
         let connection = self.clone();
 
         tokio::spawn(async move {
+            
             debug!(
                 "INIT; CONNECTION: {:?} -> {:?}",
                 connection.send_to, connection.origin_addr
@@ -105,7 +133,6 @@ impl Connection {
             
             // todo: buf pool
             let mut buf = BytesMut::with_capacity(SOCK_BUFFER_SIZE);
-
             loop {
                 connection.send_socket.readable().await?;
 

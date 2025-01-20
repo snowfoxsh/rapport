@@ -5,6 +5,7 @@ use tokio::task::JoinHandle;
 use tokio::time;
 use tokio::time::Instant;
 
+#[derive(Debug)]
 pub struct Timer {
     start: Instant,
     elapsed: Arc<AtomicU32>,
