@@ -9,6 +9,7 @@ mod config2;
 mod dns;
 
 use std::fmt::Display;
+use std::io::Error;
 use std::marker::PhantomData;
 use bytes::BytesMut;
 use dashmap::DashMap;
@@ -27,8 +28,9 @@ use hickory_resolver::AsyncResolver;
 use hickory_resolver::config::{ResolverConfig, ResolverOpts};
 use lendpool::LendPool;
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info, span, trace, trace_span, warn, Level, Span};
+use tracing::{debug, error, info, span, trace, trace_span, warn, Instrument, Level, Span};
 use tracing::field::debug;
+use tracing::instrument::Instrumented;
 use tracing_subscriber::util::SubscriberInitExt;
 use crate::dns::{init_resolver, HostSocket};
 
@@ -115,40 +117,50 @@ impl Stream {
         Ok(())
     }
 
-    fn listen(self) -> JoinHandle<io::Result<()>> {
-        task::spawn(async move {
-            let _enter = self._span.enter();
-            
-            debug!(listen_sock = %self.router.recv, "listening for packets");
+    fn listen(self) -> Instrumented<JoinHandle<io::Result<()>>> {
+        let base_span = self._span.clone();
+        tokio::spawn(async move {
+            debug!(socket = %self.router.recv, "started listening for incoming packets");
+
             let mut buf = BytesMut::with_capacity(SOCK_BUFFER_SIZE);
 
-            let listener = async {
-                loop {
-                    let span = span!(Level::TRACE, "handling packet");
-                    let _enter = span.enter();
+            loop {
+                // create a span for this packet
+                let packet_span = span!(
+                    Level::TRACE,
+                    "packet",
+                    socket = %self.router.recv
+                );
 
+                // wrap the body in an async block and attach the span
+                let result: io::Result<()> = async {
+                    // wait until the socket is ready for reading
                     self.socket().readable().await?;
-                    // todo: maybe make a tracing_span!() here for per packet debugging
 
-                    // todo: cache buffer size to determine when to shrink
+                    // attempt to receive data into the buffer.
                     let (length, from) = match self.socket().try_recv_buf_from(&mut buf) {
                         Ok((length, from)) => (length, from),
-                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                        // if nothing is available, continue the loop.
+                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
                         Err(e) => {
-                            error!(error = ?e, "failed to receive packet, terminating stream");
-                            return Err(e)
-                        },
+                            error!(error = ?e, "failed to receive packet from socket");
+                            return Err(e);
+                        }
                     };
-                    trace!(from=%from, size=length, "received packet");
 
+                    trace!(from = %from, packet_length = length, "packet received successfully");
+
+                    // process the received packet.
                     self.send(from, &buf[..length]).await?;
-                }    
-            }.await;
+                    Ok(())
+                }.instrument(packet_span).await;
 
-            error!(error = ?listener, listen_sock = %self.router.recv, "listening stopped");
-
-            listener
-        })
+                if let Err(e) = result {
+                    error!(error = ?e, socket = %self.router.recv, "packet processing error; terminating listener");
+                    return Err(e);
+                }
+            }
+        }).instrument(base_span)
     }
 }
 
@@ -229,25 +241,24 @@ async fn main() -> io::Result<()> {
     // start logging
     tracing_subscriber::fmt()
         .with_max_level(Level::TRACE)
-        .with_target(true)
         .init();
     
     // todo: add tokio thread count here
-    let server_span = span!(Level::INFO, "rapport", version=env!("CARGO_PKG_VERSION"));
-    let _enter = server_span.enter();
-
+    info!(version=env!("CARGO_PKG_VERSION"), "rapport");
     info!("starting server");
-    
+
     // init the things
-    init_resolver(None);
-    
+    let _ = init_resolver(None);
+    let _ = get_connection_pool();
+
+
     let router = StreamRouter::recv("127.0.0.1:5000".parse().unwrap()).route(
         "127.0.0.1:7000".parse().unwrap(),
-        "www.winux.com:3000".parse().unwrap(),
-    ).route("127.0.0.1:4000".parse().unwrap(), "www.winux.com:3000".parse().unwrap());
-
+        "127.0.0.1:6000".parse().unwrap(),
+    );    
+    
     let stream = Stream::bind(router).await?;
-
+    
     stream.listen().await??;
 
     info!("server shutdown");

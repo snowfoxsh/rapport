@@ -8,6 +8,8 @@ use bytes::BytesMut;
 use lendpool::LendPool;
 use tokio::sync::Mutex;
 use tokio::time;
+use tracing::{debug, span, Level};
+use tracing_futures::Instrument;
 use crate::dns::HostSocket;
 
 static CONNECTION_POOL: OnceLock<Arc<ConnectionPool>> = OnceLock::new();
@@ -31,7 +33,11 @@ impl ConnectionPool {
 
         let pool_ref = Arc::clone(&pool);
 
+        let span = span!(Level::DEBUG, "started connection pool");
         tokio::spawn(async move {
+            // let span = span!(Level::DEBUG, "started connection pool");
+            // let _enter = span.enter();
+            
             let timer = &pool_ref.timer;
             let active = &pool_ref.active;
 
@@ -54,12 +60,15 @@ impl ConnectionPool {
                     })
                 });
 
-                tracing::debug!(
-                    "FINISHED CLEANUP; ACTIVE CONNECTIONS: {}",
-                    active_connections
-                );
+                debug!(
+                    active_connections=active_connections, "finished cleanup"
+                )
+                // tracing::debug!(
+                //     "FINISHED CLEANUP; ACTIVE CONNECTIONS: {}",
+                //     active_connections
+                // );
             }
-        });
+        }).instrument(span);
 
         pool
     }
@@ -77,7 +86,7 @@ impl ConnectionPool {
 static BUFFER_POOL: OnceLock<LendPool<BytesMut>> = OnceLock::new();
 
 
-struct BufferPoolConfig {
+pub struct BufferPoolConfig {
     buffer_count: usize,
     initial_buffer_size: usize,
 }

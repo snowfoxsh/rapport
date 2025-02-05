@@ -3,12 +3,15 @@ use crate::SOCK_BUFFER_SIZE;
 use bytes::BytesMut;
 use std::hash::{Hash, Hasher};
 use std::io;
+use std::io::Error;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
-use tracing::{debug, trace, span, Level, Span, warn};
+use tracing::{debug, trace, span, Level, Span, warn, debug_span, instrument};
+use tracing::field::debug;
+use tracing_futures::{Instrument, Instrumented};
 use crate::dns::{get_resolver, HostSocket};
 
 #[derive(Clone, Debug)]
@@ -21,12 +24,13 @@ pub struct Connection {
 
     origin_addr: SocketAddr,
 
-    recv_handle: Option<Arc<JoinHandle<io::Result<()>>>>,
+    recv_handle: Option<Arc<Instrumented<JoinHandle<io::Result<()>>>>>,
 
     last_used: Arc<AtomicU32>,
     connection_pool: Arc<ConnectionPool>,
     
-    _span: Span,
+    // _span: Span,
+    pub _span: Span,
 }
 
 impl Connection {
@@ -57,14 +61,15 @@ impl Hash for Connection {
 
 // maybe will need a list of valid return addresses
 impl Connection {
+    #[instrument("connection", skip(socket))]
     pub(crate) async fn new(
         origin_addr: SocketAddr,
         socket: (Arc<UdpSocket>, SocketAddr),
         send_to: SocketAddr,
     ) -> io::Result<Arc<Connection>> {
-        let _span = span!(Level::INFO, "initiating connection");
-        let _enter_span = _span.clone();
-        let _enter = _enter_span.enter();
+        // let _span = span!(Level::INFO, "initiating connection");
+        // let _enter_span = _span.clone();
+        // let _enter = _enter_span.enter();
         
         let (recv_socket, recv_in) = socket;
 
@@ -92,12 +97,13 @@ impl Connection {
             last_used,
             connection_pool,
             
-            _span
+            _span: Span::current()
         };
         
         // begin receiving
         // connection.recv_handle = Some(Arc::new(connection.recv()));
-        let recv_handle = connection.recv();
+        let inst_recv_handle = connection.recv();
+        let recv_handle = inst_recv_handle.inner();
         
         
         if recv_handle.is_finished() {
@@ -114,49 +120,58 @@ impl Connection {
             );
         }
 
-        connection.recv_handle = Some(Arc::new(recv_handle));
+        connection.recv_handle = Some(Arc::new(inst_recv_handle));
         
         // todo: add this connection to the error watcher to await the future
         
         Ok(Arc::new(connection))
     }
 
-    fn recv(&self) -> JoinHandle<io::Result<()>> {
+    fn recv(&self) -> Instrumented<JoinHandle<io::Result<()>>> {
         let connection = self.clone();
-
+        
+        // let span = Span::current();
+        let span = debug_span!("recv connection", outward_addr=?connection.send_to, interior_addr=?connection.origin_addr);
         tokio::spawn(async move {
-            
-            debug!(
-                "INIT; CONNECTION: {:?} -> {:?}",
-                connection.send_to, connection.origin_addr
-            );
+            debug!("creating connection");
             
             // todo: buf pool
             let mut buf = BytesMut::with_capacity(SOCK_BUFFER_SIZE);
             loop {
+                // todo: add span here
                 connection.send_socket.readable().await?;
 
                 let (length, from) = match connection.send_socket.try_recv_buf_from(&mut buf) {
                     Ok((length, from)) => (length, from),
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-                    Err(e) => return Err(e),
+                    Err(e) => {
+                        warn!(error=%e,"connection ended unexpectedly");
+                        return Err(e)
+                    },
                 };
                 
                 // drop the packet if it is not from the client
                 if from != connection.send_to {
-                    debug!("DROP; FROM {:?}", connection.send_to);
+                    debug!(from=%from,"dropping packet");
                     continue;
                 }
                 connection
                     .last_used
                     .store(connection.connection_pool.time(), Ordering::Relaxed);
-                debug!(
-                    "LAST USED; {} | {}",
-                    connection.last_used.load(Ordering::Relaxed),
-                    connection.connection_pool.time()
-                );
+                
+                // debug!(
+                //     "LAST USED; {} | {}",
+                //     connection.last_used.load(Ordering::Relaxed),
+                //     connection.connection_pool.time()
+                // );
 
-                debug!("RECV; LOCATION {:?}", connection.send_to);
+                // debug!("RECV; LOCATION {:?}", connection.send_to);
+                trace!(
+                    location=%connection.send_to, 
+                    last_used_time=connection.last_used.load(Ordering::SeqCst), 
+                    current_time=connection.connection_pool.time(),
+                    "received packet"
+                );
                 let bytes = &buf[..length];
                 let sent_size = connection
                     .recv_socket
@@ -166,7 +181,7 @@ impl Connection {
 
                 buf.resize(SOCK_BUFFER_SIZE, 0x0);
             }
-        })
+        }).instrument(span)
     }
 
     pub(crate) async fn send(&self, bytes: &[u8]) -> io::Result<usize> {
@@ -187,13 +202,18 @@ impl Connection {
 }
 
 impl Drop for Connection {
+    // kill the recv connection when the connection is dropped
     fn drop(&mut self) {
         // im not quite sure why drop sometimes gets called twice
         if let Some(handle) = &self.recv_handle {
+            let _enter = self._span.enter();
+            let handle = handle.inner();
             if !handle.is_finished() {
                 handle.abort();
-                debug!("CONNECTION DROPPED");
+                debug!("connection dropped");
             }
         }
     }
 }
+
+
