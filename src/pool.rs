@@ -8,9 +8,8 @@ use bytes::BytesMut;
 use lendpool::LendPool;
 use tokio::sync::Mutex;
 use tokio::time;
-use tracing::{debug, span, Level};
+use tracing::{debug_span, trace};
 use tracing_futures::Instrument;
-use crate::dns::HostSocket;
 
 static CONNECTION_POOL: OnceLock<Arc<ConnectionPool>> = OnceLock::new();
 
@@ -33,24 +32,16 @@ impl ConnectionPool {
 
         let pool_ref = Arc::clone(&pool);
 
-        let span = span!(Level::DEBUG, "started connection pool");
+        let span = debug_span!("connection_pool");
         tokio::spawn(async move {
-            // let span = span!(Level::DEBUG, "started connection pool");
-            // let _enter = span.enter();
-            
             let timer = &pool_ref.timer;
             let active = &pool_ref.active;
 
             let mut interval = time::interval(Duration::from_secs(1));
             loop {
-                // clean up about every second
                 interval.tick().await;
 
-                // start the cleanup
-                // debug!("STARTING CLEANUP;");
                 let time = timer.time();
-
-                // we lock for a long time we only add in the beginning so it is okay
                 let mut active_connections = 0;
                 active.lock().await.iter().for_each(|sub_pool| {
                     sub_pool.retain(|_, con| {
@@ -60,13 +51,7 @@ impl ConnectionPool {
                     })
                 });
 
-                debug!(
-                    active_connections=active_connections, "finished cleanup"
-                )
-                // tracing::debug!(
-                //     "FINISHED CLEANUP; ACTIVE CONNECTIONS: {}",
-                //     active_connections
-                // );
+                trace!(active_connections, "pool sweep");
             }
         }).instrument(span);
 

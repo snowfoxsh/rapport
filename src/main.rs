@@ -8,34 +8,22 @@ mod timer;
 mod config2;
 mod dns;
 
-use std::fmt::Display;
-use std::io::Error;
-use std::marker::PhantomData;
 use bytes::BytesMut;
 use dashmap::DashMap;
-// use log::{debug, info};
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::net::{lookup_host, UdpSocket};
-use tokio::{io, task};
-
-use crate::pool::get_connection_pool;
-use connection::Connection;
-use dashmap::mapref::one::Ref;
-use futures::task::waker;
-use hickory_resolver::AsyncResolver;
-use hickory_resolver::config::{ResolverConfig, ResolverOpts};
-use lendpool::LendPool;
+use tokio::net::UdpSocket;
+use tokio::io;
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info, span, trace, trace_span, warn, Instrument, Level, Span};
-use tracing::field::debug;
+use tracing::{debug, debug_span, error, info, trace, Instrument, Level, Span};
 use tracing::instrument::Instrumented;
-use tracing_subscriber::util::SubscriberInitExt;
 use clap::Parser;
 use crate::args::Cli;
 use crate::configure::Config;
+use crate::pool::get_connection_pool;
 use crate::dns::{init_resolver, HostSocket};
+use connection::Connection;
+use dashmap::mapref::one::Ref;
 
 struct Stream {
     /// shared reference to active connections
@@ -56,14 +44,13 @@ struct Stream {
 
 impl Stream {
     pub async fn bind(router: StreamRouter) -> io::Result<Stream> {
-        // create the stream span
-        let _span = span!(Level::DEBUG, "stream", listen_sock=%router.recv);
-        
+        let _span = debug_span!("stream", listen=%router.recv);
+
         let socket = UdpSocket::bind(router.recv).await?;
+        info!(listen=%router.recv, "stream bound");
         let socket = Arc::new(socket);
 
         let active: Arc<DashMap<SocketAddr, _>> = Arc::new(DashMap::new());
-
         get_connection_pool().add(Arc::clone(&active)).await;
 
         Ok(Self {
@@ -71,8 +58,7 @@ impl Stream {
             socket_addr: router.recv,
             active,
             router,
-            
-            _span
+            _span,
         })
     }
 
@@ -81,41 +67,27 @@ impl Stream {
     }
 
     pub async fn send(&self, sent_from: SocketAddr, bytes: &[u8]) -> io::Result<()> {
-        // let span = span!(Level::TRACE, "sending packet", sending_from=%sent_from,);
-        // let _enter = span.enter();
-        trace!(sending_from=%sent_from, "sending packet");
-
-        // lookup the correct route
         let Some(send_to) = self.router.solve_route(&sent_from) else {
-            trace!(sent_from=%sent_from, "dropped packet");
-            return Ok(())
+            trace!(from=%sent_from, "no route, dropped");
+            return Ok(());
         };
-        
+
         let resolved_addr = send_to.socket().resolve().await.unwrap();
 
-        // get a handle on the connection
         let connection: Arc<Connection> = if let Some(active) = self.active.get(&resolved_addr) {
-            // the connection exists
             Arc::clone(active.value())
         } else {
-            // a new connection must be made
-            let connection = Connection::new(sent_from, (Arc::clone(&self.socket), self.socket_addr), resolved_addr).await?;
-
+            let connection = Connection::new(
+                sent_from,
+                (Arc::clone(&self.socket), self.socket_addr),
+                resolved_addr,
+            ).await?;
             self.active.insert(resolved_addr, connection.clone());
-
-            trace!(
-                send_socket=%connection.send_socket_addr(),
-                recv_socket=%connection.recv_socket_addr(),
-                origin_socket=%connection.origin_socket_addr(),
-                "creating connection"
-            );
             connection
         };
 
-        // send the bytes to the server
         let sent_size = connection.send(bytes).await?;
-
-        trace!(sent_size=sent_size, "sent packet");
+        trace!(from=%sent_from, to=%resolved_addr, bytes=sent_size, "forwarded to upstream");
 
         Ok(())
     }
@@ -123,43 +95,32 @@ impl Stream {
     fn listen(self) -> Instrumented<JoinHandle<io::Result<()>>> {
         let base_span = self._span.clone();
         tokio::spawn(async move {
-            debug!(socket = %self.router.recv, "started listening for incoming packets");
+            debug!(listen=%self.router.recv, "listening");
 
             let mut buf = BytesMut::with_capacity(SOCK_BUFFER_SIZE);
 
             loop {
-                // create a span for this packet
-                let packet_span = span!(
-                    Level::TRACE,
-                    "packet",
-                    socket = %self.router.recv
-                );
+                let packet_span = debug_span!("packet", listen=%self.router.recv);
 
-                // wrap the body in an async block and attach the span
                 let result: io::Result<()> = async {
-                    // wait until the socket is ready for reading
                     self.socket().readable().await?;
 
-                    // attempt to receive data into the buffer.
                     let (length, from) = match self.socket().try_recv_buf_from(&mut buf) {
                         Ok((length, from)) => (length, from),
-                        // if nothing is available, continue the loop.
                         Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
                         Err(e) => {
-                            error!(error = ?e, "failed to receive packet from socket");
+                            error!(error=%e, "recv error on listen socket");
                             return Err(e);
                         }
                     };
 
-                    trace!(from = %from, packet_length = length, "packet received successfully");
-
-                    // process the received packet.
+                    trace!(from=%from, bytes=length, "received");
                     self.send(from, &buf[..length]).await?;
                     Ok(())
                 }.instrument(packet_span).await;
 
                 if let Err(e) = result {
-                    error!(error = ?e, socket = %self.router.recv, "packet processing error; terminating listener");
+                    error!(error=%e, listen=%self.router.recv, "listener terminated");
                     return Err(e);
                 }
             }
