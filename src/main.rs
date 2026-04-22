@@ -8,14 +8,14 @@ mod timer;
 mod config2;
 mod dns;
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::io;
 use tokio::task::JoinHandle;
-use tracing::{debug, debug_span, error, info, trace, Instrument, Level, Span};
+use tracing::{debug, debug_span, error, info, trace, Instrument, Span};
 use tracing::instrument::Instrumented;
 use clap::Parser;
 use crate::args::Cli;
@@ -94,34 +94,35 @@ impl Stream {
 
     fn listen(self) -> Instrumented<JoinHandle<io::Result<()>>> {
         let base_span = self._span.clone();
-        tokio::spawn(async move {
-            debug!(listen=%self.router.recv, "listening");
+        let stream = Arc::new(self);
 
+        tokio::spawn(async move {
+            debug!(listen=%stream.router.recv, "listening");
             let mut buf = BytesMut::with_capacity(SOCK_BUFFER_SIZE);
 
             loop {
-                let packet_span = debug_span!("packet", listen=%self.router.recv);
+                stream.socket().readable().await?;
 
-                let result: io::Result<()> = async {
-                    self.socket().readable().await?;
-
-                    let (length, from) = match self.socket().try_recv_buf_from(&mut buf) {
-                        Ok((length, from)) => (length, from),
-                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                // Drain all packets currently in the OS buffer before yielding.
+                loop {
+                    match stream.socket().try_recv_buf_from(&mut buf) {
+                        Ok((length, from)) => {
+                            trace!(from=%from, bytes=length, "received");
+                            let bytes = Bytes::copy_from_slice(&buf[..length]);
+                            let stream = Arc::clone(&stream);
+                            tokio::spawn(async move {
+                                if let Err(e) = stream.send(from, &bytes).await {
+                                    error!(error=%e, from=%from, "packet error");
+                                }
+                            });
+                            buf.clear();
+                        }
+                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
                         Err(e) => {
-                            error!(error=%e, "recv error on listen socket");
+                            error!(error=%e, listen=%stream.router.recv, "listener terminated");
                             return Err(e);
                         }
-                    };
-
-                    trace!(from=%from, bytes=length, "received");
-                    self.send(from, &buf[..length]).await?;
-                    Ok(())
-                }.instrument(packet_span).await;
-
-                if let Err(e) = result {
-                    error!(error=%e, listen=%self.router.recv, "listener terminated");
-                    return Err(e);
+                    }
                 }
             }
         }).instrument(base_span)
@@ -203,7 +204,10 @@ pub const SOCK_BUFFER_SIZE: usize = 4096;
 #[tokio::main]
 async fn main() -> io::Result<()> {
     tracing_subscriber::fmt()
-        .with_max_level(Level::TRACE)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
         .init();
 
     info!(version = env!("CARGO_PKG_VERSION"), "rapport");
