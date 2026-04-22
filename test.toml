@@ -1,3 +1,11 @@
+connection_timeout = 30
+log_level = "info"
+
+[buffers]
+use_pool = true
+pool_count = 512
+pool_buffer_size = 4096
+
 [[routes]]
 local = "127.0.0.1:5000"
 remote = "127.0.0.1:6000"

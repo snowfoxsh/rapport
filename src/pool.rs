@@ -70,40 +70,17 @@ impl ConnectionPool {
 
 static BUFFER_POOL: OnceLock<LendPool<BytesMut>> = OnceLock::new();
 
-
-pub struct BufferPoolConfig {
-    buffer_count: usize,
-    initial_buffer_size: usize,
-}
-
-impl Default for BufferPoolConfig {
-    fn default() -> Self {
-        Self {
-            buffer_count: 100,
-            initial_buffer_size: 1024
-        }
-    }
-}
-
-pub fn init_buffer_pool<'a>(config: BufferPoolConfig) -> &'a LendPool<BytesMut> {
-    assert!(BUFFER_POOL.get().is_none(), "BUFFER_POOL has already been initialized");
-    
-    let init_with = || {
-        let pool = LendPool::new();
-
-        for _ in 0..config.buffer_count {
-            pool.add(BytesMut::with_capacity(config.initial_buffer_size))
-        }
-        
-        pool
-    };
-
-    BUFFER_POOL.get_or_init(init_with)
-}
-
-pub fn get_buffer_pool<'a>() -> &'a LendPool<BytesMut> {
+pub fn init_buffer_pool(count: usize, buffer_size: usize) {
+    assert!(BUFFER_POOL.get().is_none(), "BUFFER_POOL already initialized");
     BUFFER_POOL.get_or_init(|| {
-        panic!("BUFFER_POOL not initialized, create it with pool::init_buffer_pool")
-    })
+        let pool = LendPool::new();
+        for _ in 0..count {
+            pool.add(BytesMut::with_capacity(buffer_size));
+        }
+        pool
+    });
 }
 
+pub fn try_get_buffer_pool() -> Option<&'static LendPool<BytesMut>> {
+    BUFFER_POOL.get()
+}

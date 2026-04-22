@@ -20,30 +20,23 @@ use tracing::instrument::Instrumented;
 use clap::Parser;
 use crate::args::Cli;
 use crate::configure::Config;
-use crate::pool::get_connection_pool;
+use crate::pool::{get_connection_pool, init_buffer_pool, try_get_buffer_pool};
 use crate::dns::{init_resolver, HostSocket};
 use connection::Connection;
 use dashmap::mapref::one::Ref;
 
 struct Stream {
-    /// shared reference to active connections
-    /// Arc<T> because we need to share to timeout thread
-    active: Arc<DashMap<SocketAddr, Arc<Connection>>>, // active connections to the socket
-    
-    /// static routing table
-    router: StreamRouter, // C:x -> S:y
-    
-    /// Packets are sent to this socket, they are then routed to the appropriate socket based on the routing table
-    socket: Arc<UdpSocket>, // todo: make this not Arc<T>
-    
+    active: Arc<DashMap<SocketAddr, Arc<Connection>>>,
+    router: StreamRouter,
+    socket: Arc<UdpSocket>,
     socket_addr: SocketAddr,
-    
-    /// Store the span for logging
+    socket_buffer_size: usize,
+    connection_timeout: u32,
     _span: Span,
 }
 
 impl Stream {
-    pub async fn bind(router: StreamRouter) -> io::Result<Stream> {
+    pub async fn bind(router: StreamRouter, socket_buffer_size: usize, connection_timeout: u32) -> io::Result<Stream> {
         let _span = debug_span!("stream", listen=%router.recv);
 
         let socket = UdpSocket::bind(router.recv).await?;
@@ -58,6 +51,8 @@ impl Stream {
             socket_addr: router.recv,
             active,
             router,
+            socket_buffer_size,
+            connection_timeout,
             _span,
         })
     }
@@ -81,6 +76,8 @@ impl Stream {
                 sent_from,
                 (Arc::clone(&self.socket), self.socket_addr),
                 resolved_addr,
+                self.socket_buffer_size,
+                self.connection_timeout,
             ).await?;
             self.active.insert(resolved_addr, connection.clone());
             connection
@@ -94,33 +91,59 @@ impl Stream {
 
     fn listen(self) -> Instrumented<JoinHandle<io::Result<()>>> {
         let base_span = self._span.clone();
+        let buffer_size = self.socket_buffer_size;
         let stream = Arc::new(self);
 
         tokio::spawn(async move {
             debug!(listen=%stream.router.recv, "listening");
-            let mut buf = BytesMut::with_capacity(SOCK_BUFFER_SIZE);
+            // Scratch buffer used when pool is disabled.
+            let mut scratch = BytesMut::with_capacity(buffer_size);
 
             loop {
                 stream.socket().readable().await?;
 
-                // Drain all packets currently in the OS buffer before yielding.
                 loop {
-                    match stream.socket().try_recv_buf_from(&mut buf) {
-                        Ok((length, from)) => {
-                            trace!(from=%from, bytes=length, "received");
-                            let bytes = Bytes::copy_from_slice(&buf[..length]);
-                            let stream = Arc::clone(&stream);
-                            tokio::spawn(async move {
-                                if let Err(e) = stream.send(from, &bytes).await {
-                                    error!(error=%e, from=%from, "packet error");
-                                }
-                            });
-                            buf.clear();
+                    if let Some(mut loan) = try_get_buffer_pool().and_then(|p| p.loan()) {
+                        loan.clear();
+                        match stream.socket().try_recv_buf_from(&mut *loan) {
+                            Ok((length, from)) => {
+                                trace!(from=%from, bytes=length, "received");
+                                let stream = Arc::clone(&stream);
+                                tokio::spawn(async move {
+                                    if let Err(e) = stream.send(from, &loan[..length]).await {
+                                        error!(error=%e, from=%from, "packet error");
+                                    }
+                                    // loan drops here → returns to pool
+                                });
+                            }
+                            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                                drop(loan);
+                                break;
+                            }
+                            Err(e) => {
+                                drop(loan);
+                                error!(error=%e, listen=%stream.router.recv, "listener terminated");
+                                return Err(e);
+                            }
                         }
-                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                        Err(e) => {
-                            error!(error=%e, listen=%stream.router.recv, "listener terminated");
-                            return Err(e);
+                    } else {
+                        match stream.socket().try_recv_buf_from(&mut scratch) {
+                            Ok((length, from)) => {
+                                trace!(from=%from, bytes=length, "received");
+                                let bytes = Bytes::copy_from_slice(&scratch[..length]);
+                                let stream = Arc::clone(&stream);
+                                tokio::spawn(async move {
+                                    if let Err(e) = stream.send(from, &bytes).await {
+                                        error!(error=%e, from=%from, "packet error");
+                                    }
+                                });
+                                scratch.clear();
+                            }
+                            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                            Err(e) => {
+                                error!(error=%e, listen=%stream.router.recv, "listener terminated");
+                                return Err(e);
+                            }
                         }
                     }
                 }
@@ -145,7 +168,6 @@ impl StreamRouter {
     }
 
     pub fn add_route(&mut self, from_addr: SocketAddr, to_addr: HostSocket) {
-        // create the route
         self.routes.insert(from_addr, to_addr);
     }
 
@@ -164,10 +186,7 @@ impl StreamRouter {
     }
 
     pub fn solve_route(&self, addr: &SocketAddr) -> Option<SocketOrDefault> {
-        // dns lookup should happen in the router
-        
-        // todo: feature reverse lookup maybe
-        if let Some(route) =  self.routes.get(addr) {
+        if let Some(route) = self.routes.get(addr) {
             Some(SocketOrDefault::DashRef(route))
         } else {
             self.default.as_ref().map(|x: &HostSocket| SocketOrDefault::Ref(x))
@@ -175,7 +194,6 @@ impl StreamRouter {
     }
 }
 
-// this type exists to get value at the last possible moment
 enum SocketOrDefault<'a> {
     DashRef(Ref<'a, SocketAddr, HostSocket>),
     Ref(&'a HostSocket)
@@ -184,29 +202,32 @@ enum SocketOrDefault<'a> {
 impl<'a> SocketOrDefault<'a> {
     fn socket(&'a self) -> &'a HostSocket {
         match self {
-            SocketOrDefault::DashRef(r) => {r.value()}
-            SocketOrDefault::Ref(r) => {r}
+            SocketOrDefault::DashRef(r) => r.value(),
+            SocketOrDefault::Ref(r) => r,
         }
     }
 }
 
-// struct StreamOptions {
-//     socket_os_buffer_size: Option<usize>,
-//     socket_buffer_size: usize,
-//     allocate_from_pool: bool,
-// }
-// 
-// struct ConnectionOptions {
-//     
-// }
 pub const SOCK_BUFFER_SIZE: usize = 4096;
 
-#[tokio::main]
-async fn main() -> io::Result<()> {
+fn main() -> io::Result<()> {
+    let args = Cli::parse();
+
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(args.threads)
+        .enable_all()
+        .build()?
+        .block_on(async_main(args))
+}
+
+async fn async_main(args: Cli) -> io::Result<()> {
+    let config = Config::load_file(args.config_file.clone()).await
+        .map_err(|e| io::Error::new(e.kind(), format!("{}: {}", args.config_file, e)))?;
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&config.log_level)),
         )
         .init();
 
@@ -216,10 +237,14 @@ async fn main() -> io::Result<()> {
     let _ = init_resolver(None);
     let _ = get_connection_pool();
 
-    let args = Cli::parse();
-
-    let config = Config::load_file(args.config_file.clone()).await
-        .map_err(|e| io::Error::new(e.kind(), format!("{}: {}", args.config_file, e)))?;
+    if config.buffers.use_pool {
+        init_buffer_pool(config.buffers.pool_count, config.buffers.pool_buffer_size);
+        info!(
+            count = config.buffers.pool_count,
+            buffer_size = config.buffers.pool_buffer_size,
+            "buffer pool initialized"
+        );
+    }
 
     let listen_routes = config.to_listen_routes();
 
@@ -227,10 +252,13 @@ async fn main() -> io::Result<()> {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "no routes configured"));
     }
 
+    let socket_buffer_size = config.buffers.socket_buffer_size;
+    let connection_timeout = config.connection_timeout;
+
     let mut handles = Vec::with_capacity(listen_routes.len());
     for (listen_addr, forward_to) in listen_routes {
         let router = StreamRouter::recv(listen_addr).default(forward_to);
-        let stream = Stream::bind(router).await?;
+        let stream = Stream::bind(router, socket_buffer_size, connection_timeout).await?;
         handles.push(stream.listen());
     }
 
@@ -248,17 +276,9 @@ async fn main() -> io::Result<()> {
 async fn test_dns() {
     let resolver = AsyncResolver::tokio_from_system_conf().unwrap();
     AsyncResolver::tokio(ResolverConfig::new(), ResolverOpts::default());
-    
-    // let host = Host::parse("www.winux.com").unwrap();
+
     let host = "www.winux.com";
-    
-    
-    // let 
-    // for _ in (0..5) {
-    //     let resolv 
-    // }
-    
-    
+
     let mut times = vec![];
     for _ in (0..10) {
         let resolve1 = Instant::now();
@@ -267,33 +287,6 @@ async fn test_dns() {
     }
     println!("{times:?}");
 
-    // let resolve1 = Instant::now();
-    // let s = lookup_host(format!("{host}:3000")).await.unwrap().next().unwrap();
-    // let resolve1 = resolve1.elapsed();
-    
-    // let resolve2 = Instant::now();
     let s = resolver.lookup_ip(host).await.unwrap().iter().next().unwrap();
-    // let resolve2 = resolve2.elapsed();
-    // let addr1 = host.
-
     println!("{host:?}->{s}");
-    // println!("t1: {resolve1:?}, t2: {resolve2:?}");
 }
-
-
-// #[tokio::test]
-// async fn test_reverse() {
-//     let resolver = AsyncResolver::tokio_from_system_conf().unwrap();
-//     AsyncResolver::tokio(ResolverConfig::new(), ResolverOpts::default());
-// 
-//     let time1  = Instant::now();
-//     let s = "3.80.25.196".parse::<IpAddr>().unwrap().reverse_lookup(&resolver).await.unwrap();
-//     let time1 = time1.elapsed();
-// 
-//     let time2 = Instant::now();
-//     let s = "3.80.25.196".parse::<IpAddr>().unwrap().reverse_lookup(&resolver).await.unwrap();
-//     let time2 = time2.elapsed();
-//     
-//     println!("{:?}", time1);
-//     println!("{:?}", time2);
-// }

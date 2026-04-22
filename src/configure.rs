@@ -1,19 +1,46 @@
 use crate::dns::HostSocket;
 use crate::port_range::PortRange;
-use crate::router::Router;
 use serde_derive::Deserialize;
 use std::net::{IpAddr, SocketAddr};
 use tokio::io;
-use tokio::net::ToSocketAddrs;
 
-const fn default_buffer_pool_size() -> usize {
-    10_000
+fn default_connection_timeout() -> u32 { 30 }
+fn default_log_level() -> String { "info".to_string() }
+fn default_socket_buffer_size() -> usize { 4096 }
+fn default_pool_count() -> usize { 256 }
+fn default_pool_buffer_size() -> usize { 4096 }
+
+#[derive(Deserialize, Debug)]
+pub struct BufferConfig {
+    #[serde(default = "default_socket_buffer_size")]
+    pub socket_buffer_size: usize,
+    #[serde(default)]
+    pub use_pool: bool,
+    #[serde(default = "default_pool_count")]
+    pub pool_count: usize,
+    #[serde(default = "default_pool_buffer_size")]
+    pub pool_buffer_size: usize,
+}
+
+impl Default for BufferConfig {
+    fn default() -> Self {
+        Self {
+            socket_buffer_size: default_socket_buffer_size(),
+            use_pool: false,
+            pool_count: default_pool_count(),
+            pool_buffer_size: default_pool_buffer_size(),
+        }
+    }
 }
 
 #[derive(Deserialize, Debug)]
 pub struct Config {
-    #[serde(default = "default_buffer_pool_size")]
-    pub buffer_pool_permits: usize,
+    #[serde(default = "default_connection_timeout")]
+    pub connection_timeout: u32,
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
+    #[serde(default)]
+    pub buffers: BufferConfig,
     pub routes: Vec<RouteConfig>,
 }
 
@@ -98,65 +125,5 @@ impl Config {
             }
         }
         pairs
-    }
-
-    pub fn router(&self) -> Router {
-        let mut router = Router::new();
-
-        for route in &self.routes {
-            match route {
-                RouteConfig::SinglePort { local, remote } => {
-                    router.add_route(*local, *remote);
-                }
-                RouteConfig::ManyPorts {
-                    local_addr,
-                    remote_addr,
-                    ports,
-                } => {
-                    for &port in ports {
-                        router.add_route(
-                            SocketAddr::new(*local_addr, port),
-                            SocketAddr::new(*remote_addr, port),
-                        );
-                    }
-                }
-                RouteConfig::ManyComplexPorts {
-                    local_addr,
-                    remote_addr,
-                    local_ports,
-                    remote_ports,
-                } => {
-                    assert_eq!(
-                        local_ports.len(),
-                        remote_ports.len(),
-                        "cannot have an unequal number of local and remote ports"
-                    );
-
-                    for (&local_port, &remote_port) in local_ports.iter().zip(remote_ports.iter()) {
-                        router.add_route(
-                            SocketAddr::new(*local_addr, local_port),
-                            SocketAddr::new(*remote_addr, remote_port),
-                        );
-                    }
-                }
-                RouteConfig::SimpleRange {
-                    local_addr: local,
-                    remote_addr: remote,
-                    port_range,
-                } => router.add_direct_routes(*local, *remote, port_range.clone()),
-                RouteConfig::ComplexPortRange {
-                    local_addr: local,
-                    remote_addr: remote,
-                    local_port_range,
-                    remote_port_range,
-                } => {
-                    router.add_offset_routes(*local, local_port_range.clone(), *remote, remote_port_range.clone())
-                        .expect(format!("local port range {local_port_range:?} must be the same length as remote port range {remote_port_range:?}").as_str());
-                }
-                
-            }
-        }
-
-        router
     }
 }

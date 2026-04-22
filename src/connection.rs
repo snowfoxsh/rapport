@@ -1,6 +1,6 @@
-use crate::pool::{get_connection_pool, ConnectionPool};
-use crate::SOCK_BUFFER_SIZE;
+use crate::pool::{get_connection_pool, try_get_buffer_pool, ConnectionPool};
 use bytes::BytesMut;
+use lendpool::Loan;
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::net::SocketAddr;
@@ -10,6 +10,20 @@ use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 use tracing::{debug, debug_span, instrument, trace, warn, Span};
 use tracing_futures::{Instrument, Instrumented};
+
+enum ConnectionBuf {
+    Pooled(Loan<'static, BytesMut>),
+    Fixed(BytesMut),
+}
+
+impl ConnectionBuf {
+    fn get_mut(&mut self) -> &mut BytesMut {
+        match self {
+            Self::Pooled(l) => l,
+            Self::Fixed(b) => b,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Connection {
@@ -25,16 +39,16 @@ pub struct Connection {
 
     last_used: Arc<AtomicU32>,
     connection_pool: Arc<ConnectionPool>,
-    
-    // _span: Span,
+
+    timeout: u32,
+    buffer_size: usize,
+
     pub _span: Span,
 }
 
 impl Connection {
     pub fn send_socket_addr(&self) -> SocketAddr { self.send_to }
-    
     pub fn recv_socket_addr(&self) -> SocketAddr { self.recv_in }
-    
     pub fn origin_socket_addr(&self) -> SocketAddr { self.origin_addr }
 }
 
@@ -56,13 +70,14 @@ impl Hash for Connection {
     }
 }
 
-// maybe will need a list of valid return addresses
 impl Connection {
     #[instrument("connection", skip(socket), fields(origin=%origin_addr, upstream=%send_to))]
     pub(crate) async fn new(
         origin_addr: SocketAddr,
         socket: (Arc<UdpSocket>, SocketAddr),
         send_to: SocketAddr,
+        buffer_size: usize,
+        timeout: u32,
     ) -> io::Result<Arc<Connection>> {
         let (recv_socket, recv_in) = socket;
 
@@ -82,6 +97,8 @@ impl Connection {
             recv_handle: None,
             last_used,
             connection_pool,
+            timeout,
+            buffer_size,
             _span: Span::current(),
         };
 
@@ -99,13 +116,21 @@ impl Connection {
 
     fn recv(&self) -> Instrumented<JoinHandle<io::Result<()>>> {
         let connection = self.clone();
+        let buffer_size = self.buffer_size;
         let span = debug_span!("recv", upstream=%connection.send_to, origin=%connection.origin_addr);
         tokio::spawn(async move {
-            let mut buf = BytesMut::with_capacity(SOCK_BUFFER_SIZE);
+            let mut conn_buf = match try_get_buffer_pool().and_then(|p| p.loan()) {
+                Some(loan) => ConnectionBuf::Pooled(loan),
+                None => ConnectionBuf::Fixed(BytesMut::with_capacity(buffer_size)),
+            };
+
             loop {
                 connection.send_socket.readable().await?;
 
-                let (length, from) = match connection.send_socket.try_recv_buf_from(&mut buf) {
+                let buf = conn_buf.get_mut();
+                buf.clear();
+
+                let (length, from) = match connection.send_socket.try_recv_buf_from(buf) {
                     Ok((length, from)) => (length, from),
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
                     Err(e) => {
@@ -129,8 +154,6 @@ impl Connection {
                     .await?;
 
                 trace!(to=%connection.origin_addr, bytes=sent_size, "forwarded to origin");
-
-                buf.resize(SOCK_BUFFER_SIZE, 0x0);
             }
         }).instrument(span)
     }
@@ -144,7 +167,7 @@ impl Connection {
     }
 
     pub(crate) fn timeout(&self) -> u32 {
-        4
+        self.timeout
     }
 
     pub(crate) fn last_active(&self) -> u32 {
@@ -164,5 +187,3 @@ impl Drop for Connection {
         }
     }
 }
-
-
