@@ -217,9 +217,16 @@ impl HostAddr {
 // }
 
 impl HostSocket {
+    pub fn from_socketaddr(addr: SocketAddr) -> HostSocket {
+        HostSocket {
+            addr: HostAddr::Addr(addr.ip()),
+            port: addr.port(),
+        }
+    }
+
     pub(crate) async fn resolve(&self) -> Result<SocketAddr, LookupError> {
         let addr = self.addr.resolve().await?;
-        
+
         Ok(SocketAddr::new(addr, self.port))
     }
 }

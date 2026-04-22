@@ -32,6 +32,9 @@ use tracing::{debug, error, info, span, trace, trace_span, warn, Instrument, Lev
 use tracing::field::debug;
 use tracing::instrument::Instrumented;
 use tracing_subscriber::util::SubscriberInitExt;
+use clap::Parser;
+use crate::args::Cli;
+use crate::configure::Config;
 use crate::dns::{init_resolver, HostSocket};
 
 struct Stream {
@@ -238,28 +241,39 @@ pub const SOCK_BUFFER_SIZE: usize = 4096;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    // start logging
     tracing_subscriber::fmt()
         .with_max_level(Level::TRACE)
         .init();
-    
-    // todo: add tokio thread count here
-    info!(version=env!("CARGO_PKG_VERSION"), "rapport");
+
+    info!(version = env!("CARGO_PKG_VERSION"), "rapport");
     info!("starting server");
 
-    // init the things
     let _ = init_resolver(None);
     let _ = get_connection_pool();
 
+    let args = Cli::parse();
 
-    let router = StreamRouter::recv("127.0.0.1:5000".parse().unwrap()).route(
-        "127.0.0.1:7000".parse().unwrap(),
-        "127.0.0.1:6000".parse().unwrap(),
-    );    
-    
-    let stream = Stream::bind(router).await?;
-    
-    stream.listen().await??;
+    let config = Config::load_file(args.config_file.clone()).await
+        .map_err(|e| io::Error::new(e.kind(), format!("{}: {}", args.config_file, e)))?;
+
+    let listen_routes = config.to_listen_routes();
+
+    if listen_routes.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "no routes configured"));
+    }
+
+    let mut handles = Vec::with_capacity(listen_routes.len());
+    for (listen_addr, forward_to) in listen_routes {
+        let router = StreamRouter::recv(listen_addr).default(forward_to);
+        let stream = Stream::bind(router).await?;
+        handles.push(stream.listen());
+    }
+
+    info!(stream_count = handles.len(), "all streams bound, listening");
+
+    for handle in handles {
+        handle.await??;
+    }
 
     info!("server shutdown");
     Ok(())

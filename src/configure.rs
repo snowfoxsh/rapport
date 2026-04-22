@@ -1,3 +1,4 @@
+use crate::dns::HostSocket;
 use crate::port_range::PortRange;
 use crate::router::Router;
 use serde_derive::Deserialize;
@@ -53,6 +54,50 @@ impl Config {
         let config: Config =
             toml::from_str(&content).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         Ok(config)
+    }
+
+    pub fn to_listen_routes(&self) -> Vec<(SocketAddr, HostSocket)> {
+        let mut pairs = Vec::new();
+        for route in &self.routes {
+            match route {
+                RouteConfig::SinglePort { local, remote } => {
+                    pairs.push((*local, HostSocket::from_socketaddr(*remote)));
+                }
+                RouteConfig::ManyPorts { local_addr, remote_addr, ports } => {
+                    for &port in ports {
+                        pairs.push((
+                            SocketAddr::new(*local_addr, port),
+                            HostSocket::from_socketaddr(SocketAddr::new(*remote_addr, port)),
+                        ));
+                    }
+                }
+                RouteConfig::ManyComplexPorts { local_addr, remote_addr, local_ports, remote_ports } => {
+                    for (&lp, &rp) in local_ports.iter().zip(remote_ports.iter()) {
+                        pairs.push((
+                            SocketAddr::new(*local_addr, lp),
+                            HostSocket::from_socketaddr(SocketAddr::new(*remote_addr, rp)),
+                        ));
+                    }
+                }
+                RouteConfig::SimpleRange { local_addr, remote_addr, port_range } => {
+                    for port in port_range.clone() {
+                        pairs.push((
+                            SocketAddr::new(*local_addr, port),
+                            HostSocket::from_socketaddr(SocketAddr::new(*remote_addr, port)),
+                        ));
+                    }
+                }
+                RouteConfig::ComplexPortRange { local_addr, remote_addr, local_port_range, remote_port_range } => {
+                    for (lp, rp) in local_port_range.clone().zip(remote_port_range.clone()) {
+                        pairs.push((
+                            SocketAddr::new(*local_addr, lp),
+                            HostSocket::from_socketaddr(SocketAddr::new(*remote_addr, rp)),
+                        ));
+                    }
+                }
+            }
+        }
+        pairs
     }
 
     pub fn router(&self) -> Router {
